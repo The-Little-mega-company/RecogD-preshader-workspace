@@ -1,0 +1,28 @@
+{
+  "engine": {
+    "time_window_seconds": 0.75,
+    "max_file_size_bytes": 16777216,
+    "min_confidence_hits": 2,
+    "stripe_confidence_hits": 4,
+    "max_preload_children": 35,
+    "ram_pin_cooldown_seconds": 5.0,
+    "max_parent_nodes": 60000,
+    "autosave_interval_seconds": 180,
+    "process_scan_interval_seconds": 2.0
+  },
+  "external_drive": {
+    "mount_point": "/mnt/preshader",
+    "label": "preshader",
+    "enable_cross_bus_striping": true,
+    "max_stripe_file_bytes": 8388608,
+    "read_ahead_kb": 4096
+  },
+  "target_extensions": [
+    ".pbo", ".edds", ".paa", ".rvmat", ".bin", ".wss", ".ogg", ".wav",
+    ".anm", ".xob", ".agr", ".asi", ".ast", ".asy", ".ptc", ".c",
+    ".dxvk-cache", ".foz", ".idx", ".bsa", ".ba2", ".nif", ".hkx",
+    ".dds", ".spv", ".esp", ".esm", ".esl", ".xwm", ".fuz", ".fxp",
+    ".pak", ".ucas", ".utoc", ".upk", ".umap", ".uasset", ". ubulk",
+    ".vpk", ".assets", ".resS", ".resource", ".bundle", ".bank", ".fsb"
+  ]
+}

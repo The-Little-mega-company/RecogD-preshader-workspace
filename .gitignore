@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Rust build artifacts (in case you build a Rust core)
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# VS Code local workspace settings (keeps your personal UI config off Git)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+
+# Runtime logs, database files, and local test traces
+*.log
+*.sqlite
+*.db
+*.trace
+/records/
+/test_cache/
+
+# OS and Linux specific files
+.DS_Store
+*~
+*.swp
+*.swo./scripts/recogd-launch.sh dayz
