@@ -7,8 +7,8 @@ preload likely next assets into the filesystem cache.
 
 The desktop UI includes a system-tray icon, profile selector, start/stop control,
 live read/write rates for the daemon, and a recent preload timeline. Closing the
-window hides it in the tray; choose **Quit RecogD** from the tray menu to stop
-the daemon and exit.
+window hides it in the tray; choose **Quit RecogD** from the tray menu to stop the
+daemon and exit.
 
 Install the system packages for Python Tkinter and GTK 3 introspection (used by
 the tray icon), then install the Python tray packages and start the dashboard.
