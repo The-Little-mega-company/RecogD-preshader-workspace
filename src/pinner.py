@@ -2,105 +2,154 @@
 import os
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+
+POSIX_FADV_WILLNEED = getattr(os, "POSIX_FADV_WILLNEED", 3)
+POSIX_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
 
 
-class RamPinner:
-    def __init__(self, cooldown_sec=5.0, max_size_bytes=16777216, external_mount="/mnt/preshader"):
-        self.cooldown_sec = cooldown_sec
-        self.max_size_bytes = max_size_bytes
-        self.external_mount = os.path.abspath(os.path.expanduser(external_mount))
-        self.cooldown_map = {}
+class RamBudgetGovernor:
+    def __init__(self, max_ram_fraction=0.30, min_free_mb=2560):
+        self.max_ram_fraction = max_ram_fraction
+        self.min_free_bytes = min_free_mb * 1024 * 1024
+        self.total_ram_bytes = self._read_meminfo_bytes("MemTotal") or (16 * 1024 * 1024 * 1024)
+        self.max_budget_bytes = int(self.total_ram_bytes * self.max_ram_fraction)
+        self.last_check = 0.0
+        self.cached_avail = self.total_ram_bytes
+
+    def _read_meminfo_bytes(self, key):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith(key + ":"):
+                        parts = line.split()
+                        return int(parts[1]) * 1024
+        except Exception:
+            pass
+        return 0
+
+    def get_available_ram(self):
+        now = time.monotonic()
+        if (now - self.last_check) > 2.5:
+            avail = self._read_meminfo_bytes("MemAvailable")
+            if avail > 0:
+                self.cached_avail = avail
+            self.last_check = now
+        return self.cached_avail
+
+    def check_pressure(self, current_pinned_bytes):
+        avail = self.get_available_ram()
+        under_pressure = (avail < self.min_free_bytes) or (current_pinned_bytes > self.max_budget_bytes)
+        return under_pressure, avail
+
+
+class AssetPinner:
+    def __init__(self, storage, max_file_mb=64):
+        self.storage = storage
+        self.max_file_bytes = max_file_mb * 1024 * 1024
+        self.governor = RamBudgetGovernor(max_ram_fraction=0.30, min_free_mb=2560)
+
+        self.active_pins = OrderedDict()
+        self.current_pinned_bytes = 0
+
+        self.nvme_files = 0
+        self.nvme_bytes = 0
+        self.sata_files = 0
+        self.sata_bytes = 0
+        self.evicted_files = 0
+        self.evicted_bytes = 0
+        self.toggle_counter = 0
         self.lock = threading.Lock()
 
-        self.nvme_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="RecogNVMe")
-        self.ext_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="RecogExtSSD")
-        self.reset_stats()
+    def _evict_oldest_until_safe(self, needed_bytes=0):
+        evicted_now = 0
+        while self.active_pins:
+            under_pressure, _ = self.governor.check_pressure(self.current_pinned_bytes + needed_bytes)
+            if not under_pressure:
+                break
 
-    def reset_stats(self):
-        with self.lock:
-            self.stats = {
-                "total_pinned_files": 0,
-                "total_pinned_bytes": 0,
-                "nvme_pinned_files": 0,
-                "nvme_pinned_bytes": 0,
-                "ext_pinned_files": 0,
-                "ext_pinned_bytes": 0,
-                "skipped_cooldown": 0,
-                "errors": 0
-            }
-
-    def is_external_path(self, filepath):
-        return os.path.abspath(filepath).startswith(self.external_mount)
-
-    def _pin_file_sync(self, filepath, is_external):
-        try:
-            st = os.stat(filepath)
-            if st.st_size == 0:
-                return
-
-            pin_length = min(st.st_size, self.max_size_bytes)
-            flags = os.O_RDONLY | os.O_NONBLOCK
-            if hasattr(os, "O_NOATIME"):
-                try:
-                    fd = os.open(filepath, flags | os.O_NOATIME)
-                except PermissionError:
-                    fd = os.open(filepath, flags)
-            else:
-                fd = os.open(filepath, flags)
+            old_path, (old_size, _) = self.active_pins.popitem(last=False)
+            self.current_pinned_bytes = max(0, self.current_pinned_bytes - old_size)
+            self.evicted_files += 1
+            self.evicted_bytes += old_size
+            evicted_now += 1
 
             try:
-                if is_external and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
-                    os.posix_fadvise(fd, 0, pin_length, os.POSIX_FADV_SEQUENTIAL)
-                os.posix_fadvise(fd, 0, pin_length, os.POSIX_FADV_WILLNEED)
+                if os.path.isfile(old_path):
+                    fd = os.open(old_path, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+                    try:
+                        os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+                    finally:
+                        os.close(fd)
+            except OSError:
+                pass
+        return evicted_now
 
-                with self.lock:
-                    self.stats["total_pinned_files"] += 1
-                    self.stats["total_pinned_bytes"] += pin_length
-                    if is_external:
-                        self.stats["ext_pinned_files"] += 1
-                        self.stats["ext_pinned_bytes"] += pin_length
-                    else:
-                        self.stats["nvme_pinned_files"] += 1
-                        self.stats["nvme_pinned_bytes"] += pin_length
-            finally:
-                os.close(fd)
-        except (OSError, PermissionError):
-            with self.lock:
-                self.stats["errors"] += 1
-
-    def request_pin(self, filepath):
-        now = time.monotonic()
+    def pin_file(self, filepath):
         with self.lock:
-            last_pin = self.cooldown_map.get(filepath, 0.0)
-            if (now - last_pin) < self.cooldown_sec:
-                self.stats["skipped_cooldown"] += 1
+            if filepath in self.active_pins:
+                self.active_pins.move_to_end(filepath)
                 return False
 
-            self.cooldown_map[filepath] = now
-            if len(self.cooldown_map) > 25000:
-                cutoff = now - (self.cooldown_sec * 2)
-                self.cooldown_map = {k: v for k, v in self.cooldown_map.items() if v > cutoff}
+            self.toggle_counter += 1
+            target_path = self.storage.resolve_dual_bus_path(filepath, self.toggle_counter)
 
-        if self.is_external_path(filepath):
-            self.ext_executor.submit(self._pin_file_sync, filepath, True)
-        else:
-            self.nvme_executor.submit(self._pin_file_sync, filepath, False)
-        return True
+        try:
+            if not os.path.isfile(target_path):
+                return False
+            st = os.stat(target_path)
+            if st.st_size <= 0 or st.st_size > self.max_file_bytes:
+                return False
 
-    def prewarm_directory(self, directory_path):
-        expanded = os.path.expanduser(directory_path)
-        if not expanded or not os.path.exists(expanded):
-            return 0
-        count = 0
-        for root, _, files in os.walk(expanded):
-            for fname in files:
-                if fname.endswith((".foz", ".dxvk-cache", ".spv", ".bin", ".idx", ".cache")):
-                    fpath = os.path.join(root, fname)
-                    if self.request_pin(fpath):
-                        count += 1
-        return count
+            with self.lock:
+                self._evict_oldest_until_safe(needed_bytes=st.st_size)
+                under_pressure, _ = self.governor.check_pressure(self.current_pinned_bytes + st.st_size)
+                if under_pressure:
+                    return False
 
-    def shutdown(self):
-        self.nvme_executor.shutdown(wait=False)
-        self.ext_executor.shutdown(wait=False)
+            flags = os.O_RDONLY
+            try:
+                fd = os.open(target_path, flags | getattr(os, "O_NOATIME", 0))
+            except PermissionError:
+                fd = os.open(target_path, flags)
+
+            try:
+                os.posix_fadvise(fd, 0, st.st_size, POSIX_FADV_WILLNEED)
+            finally:
+                os.close(fd)
+
+            is_external = target_path.startswith(self.storage.external_mount)
+            bus_type = "sata" if is_external else "nvme"
+
+            with self.lock:
+                self.active_pins[target_path] = (st.st_size, bus_type)
+                self.current_pinned_bytes += st.st_size
+                if is_external:
+                    self.sata_files += 1
+                    self.sata_bytes += st.st_size
+                else:
+                    self.nvme_files += 1
+                    self.nvme_bytes += st.st_size
+
+            return True
+        except OSError:
+            return False
+
+    def get_stats(self):
+        with self.lock:
+            avail_mb = round(self.governor.get_available_ram() / (1024 * 1024), 2)
+            budget_mb = round(self.governor.max_budget_bytes / (1024 * 1024), 2)
+            active_mb = round(self.current_pinned_bytes / (1024 * 1024), 2)
+            return {
+                "total_pinned_files": self.nvme_files + self.sata_files,
+                "total_pinned_mb": round((self.nvme_bytes + self.sata_bytes) / (1024 * 1024), 2),
+                "nvme_files": self.nvme_files,
+                "nvme_mb": round(self.nvme_bytes / (1024 * 1024), 2),
+                "sata_files": self.sata_files,
+                "sata_mb": round(self.sata_bytes / (1024 * 1024), 2),
+                "active_ram_pinned_mb": active_mb,
+                "ram_budget_ceiling_mb": budget_mb,
+                "system_avail_ram_mb": avail_mb,
+                "governor_evicted_files": self.evicted_files,
+                "governor_evicted_mb": round(self.evicted_bytes / (1024 * 1024), 2)
+            }
