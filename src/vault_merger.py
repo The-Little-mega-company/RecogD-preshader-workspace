@@ -2,6 +2,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -10,8 +11,19 @@ from collections import defaultdict
 PRECOMPILED_EXTENSIONS = (
     ".foz", ".dxvk-cache", ".spv", ".bin", ".idx", ".cache",
     ".pak", ".esl", ".esm", ".esp", ".ba2", ".bsa", ".pbo",
-    ".edds", ".paa", ".rvmat", ".ucas", ".utoc", ".vpk"
+    ".edds", ".paa", ".rvmat", ".ucas", ".utoc", ".vpk",
+    ".jar", ".mca", ".dat"
 )
+
+
+def normalize_safe_id(safe_id):
+    cleaned = re.sub(r"_+", "_", safe_id.strip()).strip("_")
+    return cleaned
+
+
+def is_placeholder_safe_id(safe_id):
+    low = safe_id.lower()
+    return "appid_" in low or low.endswith("_unknowngame")
 
 
 def detect_preshader_mounts():
@@ -21,14 +33,22 @@ def detect_preshader_mounts():
     user = os.environ.get("USER", "kessia")
     ext_candidates = [
         f"/run/media/{user}/preshader",
+        "/run/media/kessiathecreator/preshader",
+        "/run/media/kessia/preshader",
         f"/var/run/media/{user}/preshader",
         f"/media/{user}/preshader",
         "/mnt/preshader"
     ]
-    ext_mount = "/run/media/kessia/preshader"
+    for pattern in ("/run/media/*/*/recogd-vault", "/mnt/*/recogd-vault"):
+        for match in glob.glob(pattern):
+            parent = os.path.dirname(match)
+            if parent not in ext_candidates:
+                ext_candidates.append(parent)
+
+    ext_mount = f"/run/media/{user}/preshader"
     for cand in ext_candidates:
         if os.path.isdir(cand) and (os.path.ismount(cand) or os.path.isdir(os.path.join(cand, "recogd-vault"))):
-            ext_mount = cand
+            ext_mount = os.path.realpath(cand)
             break
 
     ext_vault = os.path.join(ext_mount, "recogd-vault")
@@ -40,7 +60,7 @@ class VaultCacheMerger:
     """
     Unifies the external Preshader SSD vault (/run/media/$USER/preshader/recogd-vault)
     and internal NVMe vault (~/.cache/recogd-fallback) into one cohesive cache index,
-    and pre-pins precompiled shader/asset caches (.foz, .pak, .bin, .esl, .esm) into RAM.
+    deduplicating by AppID and removing stale fallback/duplicate directories.
     """
 
     def __init__(self, ext_vault=None, nvme_vault=None):
@@ -51,9 +71,13 @@ class VaultCacheMerger:
 
     def active_vault_roots(self):
         roots = []
+        seen_real = set()
         for r in (self.ext_vault, self.nvme_vault):
-            if r and os.path.isdir(r) and r not in roots:
-                roots.append(r)
+            if r and os.path.isdir(r):
+                real_r = os.path.realpath(r)
+                if real_r not in seen_real:
+                    seen_real.add(real_r)
+                    roots.append(r)
         return roots
 
     def primary_vault_root(self):
@@ -62,53 +86,101 @@ class VaultCacheMerger:
         os.makedirs(self.nvme_vault, exist_ok=True)
         return self.nvme_vault
 
+    def _merge_directory_contents(self, src_dir, dst_dir):
+        if not os.path.isdir(src_dir):
+            return
+        os.makedirs(dst_dir, exist_ok=True)
+        for item in os.listdir(src_dir):
+            s_item = os.path.join(src_dir, item)
+            d_item = os.path.join(dst_dir, item)
+            if os.path.isdir(s_item):
+                self._merge_directory_contents(s_item, d_item)
+            elif os.path.isfile(s_item):
+                if not os.path.exists(d_item):
+                    try:
+                        shutil.copy2(s_item, d_item)
+                    except OSError:
+                        pass
+
     def sync_and_merge_vaults(self):
         """
-        Merges learned Markov graphs (brain.json + legacy dayz_brain.json) and
-        indexes precompiled caches across both the External SSD and Internal NVMe vaults.
+        Merges learned Markov graphs across both vaults, consolidates duplicate AppID
+        directories (such as double-underscore or appid_XXX folders), and removes
+        redundant fallback directories once safely merged onto the External SSD.
         """
         os.makedirs(os.path.join(self.nvme_vault, "games"), exist_ok=True)
-        if os.path.isdir(self.ext_mount) and os.access(self.ext_mount, os.W_OK):
+        ext_writable = os.path.isdir(self.ext_mount) and os.access(self.ext_mount, os.W_OK)
+        if ext_writable:
             os.makedirs(os.path.join(self.ext_vault, "games"), exist_ok=True)
             os.makedirs(os.path.join(self.ext_vault, "global_shader_cache"), exist_ok=True)
 
+        target_primary_vault = self.ext_vault if ext_writable else self.nvme_vault
+
         # 1. Fold legacy ~/.cache/recogd-fallback/brain_index/dayz_brain.json into 221100_DayZ
         legacy_dayz = os.path.join(self.nvme_vault, "brain_index", "dayz_brain.json")
-        target_dayz_vault = (
-            self.ext_vault
-            if os.path.isdir(os.path.join(self.ext_vault, "games"))
-            else self.nvme_vault
-        )
         if os.path.isfile(legacy_dayz):
-            dayz_db = os.path.join(target_dayz_vault, "games", "221100_DayZ", "brain_index", "brain.json")
-            self._merge_two_brain_files(
+            dayz_db = os.path.join(target_primary_vault, "games", "221100_DayZ", "brain_index", "brain.json")
+            if self._merge_two_brain_files(
                 legacy_dayz,
                 dayz_db,
                 default_meta={"game_name": "DayZ", "appid": "221100", "safe_id": "221100_DayZ"}
-            )
+            ):
+                try:
+                    os.remove(legacy_dayz)
+                except OSError:
+                    pass
 
-        # 2. Discover all game safe_ids across both vaults and merge their brain.json graphs
-        game_ids = set()
+        # 2. Group all discovered game directories across all roots by AppID
+        appid_groups = defaultdict(list)
         for root in self.active_vault_roots():
             games_dir = os.path.join(root, "games")
-            if os.path.isdir(games_dir):
-                for entry in os.listdir(games_dir):
-                    if entry == "custom_SteamLinuxRuntime_4":
-                        continue
-                    if os.path.isdir(os.path.join(games_dir, entry)):
-                        game_ids.add(entry)
+            if not os.path.isdir(games_dir):
+                continue
+            for entry in os.listdir(games_dir):
+                if entry == "custom_SteamLinuxRuntime_4":
+                    continue
+                full_dir = os.path.join(games_dir, entry)
+                if not os.path.isdir(full_dir):
+                    continue
+                appid = entry.split("_", 1)[0]
+                appid_groups[appid].append((root, entry, full_dir))
 
         merged_count = 0
-        for safe_id in sorted(game_ids):
-            ext_db = os.path.join(self.ext_vault, "games", safe_id, "brain_index", "brain.json")
-            nvme_db = os.path.join(self.nvme_vault, "games", safe_id, "brain_index", "brain.json")
-            if os.path.isfile(ext_db) and os.path.isfile(nvme_db):
-                self._merge_two_brain_files(nvme_db, ext_db)
-                merged_count += 1
-            elif os.path.isfile(nvme_db) and os.path.isdir(self.ext_vault) and os.access(self.ext_vault, os.W_OK):
-                os.makedirs(os.path.dirname(ext_db), exist_ok=True)
-                shutil.copy2(nvme_db, ext_db)
-                merged_count += 1
+
+        # 3. For each AppID, pick the canonical safe_id and merge all variants into primary vault
+        for appid, folders in appid_groups.items():
+            canonical_safe_id = None
+            for _, entry, _ in folders:
+                norm = normalize_safe_id(entry)
+                if not is_placeholder_safe_id(norm):
+                    canonical_safe_id = norm
+                    break
+            if not canonical_safe_id:
+                canonical_safe_id = normalize_safe_id(folders[0][1])
+
+            canonical_dir = os.path.join(target_primary_vault, "games", canonical_safe_id)
+            canonical_db = os.path.join(canonical_dir, "brain_index", "brain.json")
+
+            for root, entry, full_dir in folders:
+                if os.path.realpath(full_dir) == os.path.realpath(canonical_dir):
+                    continue
+
+                src_db = os.path.join(full_dir, "brain_index", "brain.json")
+                if os.path.isfile(src_db):
+                    self._merge_two_brain_files(src_db, canonical_db)
+                    merged_count += 1
+
+                for sub in ("hot_stripe_cache", "shader_cache"):
+                    self._merge_directory_contents(
+                        os.path.join(full_dir, sub),
+                        os.path.join(canonical_dir, sub)
+                    )
+
+                # Remove the duplicate or fallback folder after merging into canonical
+                try:
+                    shutil.rmtree(full_dir)
+                except OSError:
+                    pass
 
         return merged_count
 
@@ -147,8 +219,22 @@ class VaultCacheMerger:
                         merged_stripes[orig] = mirrored
 
         meta = dict(default_meta or {})
-        meta.update(src_data.get("metadata", {}))
-        meta.update(dst_data.get("metadata", {}))
+        src_meta = src_data.get("metadata", {})
+        dst_meta = dst_data.get("metadata", {})
+        meta.update(src_meta)
+        meta.update(dst_meta)
+
+        # Keep clean game name if one of the brains had a placeholder name
+        src_name = src_meta.get("game_name", "")
+        dst_name = dst_meta.get("game_name", "")
+        if dst_name.startswith("appid_") and src_name and not src_name.startswith("appid_"):
+            meta["game_name"] = src_name
+        elif src_name.startswith("appid_") and dst_name and not dst_name.startswith("appid_"):
+            meta["game_name"] = dst_name
+
+        if "safe_id" in meta:
+            meta["safe_id"] = normalize_safe_id(meta["safe_id"])
+
         meta["updated_at_epoch"] = int(time.time())
         meta["total_parent_nodes"] = len(merged_graph)
         meta["total_edges"] = sum(len(c) for c in merged_graph.values())
@@ -171,11 +257,10 @@ class VaultCacheMerger:
 
     def discover_precompiled_caches(self):
         """
-        Scans /run/media/$USER/preshader/recogd-vault and ~/.cache/recogd-fallback
-        for all per-game brain indexes and precompiled cache files (.foz, .pak, .bin, .esl, .esm).
-        Returns a list of game cache entries sorted by activity/size.
+        Scans active vaults after merging duplicates and returns one entry per AppID.
         """
-        entries_by_id = {}
+        self.sync_and_merge_vaults()
+        entries_by_appid = {}
 
         for root in self.active_vault_roots():
             games_dir = os.path.join(root, "games")
@@ -189,10 +274,11 @@ class VaultCacheMerger:
                 if not os.path.isdir(g_vault):
                     continue
 
-                entry = entries_by_id.setdefault(safe_id, {
-                    "safe_id": safe_id,
-                    "game_name": safe_id.split("_", 1)[-1].replace("_", " "),
-                    "appid": safe_id.split("_", 1)[0],
+                appid = safe_id.split("_", 1)[0]
+                entry = entries_by_appid.setdefault(appid, {
+                    "safe_id": normalize_safe_id(safe_id),
+                    "game_name": normalize_safe_id(safe_id).split("_", 1)[-1].replace("_", " "),
+                    "appid": appid,
                     "brain_path": "",
                     "nodes": 0,
                     "edges": 0,
@@ -204,7 +290,6 @@ class VaultCacheMerger:
                     "graph_preview": {}
                 })
 
-                # Read brain.json if present
                 db_path = os.path.join(g_vault, "brain_index", "brain.json")
                 if os.path.isfile(db_path):
                     try:
@@ -215,9 +300,11 @@ class VaultCacheMerger:
                         stripes = data.get("stripe_map", {})
                         stats = meta.get("session_stats", {})
 
-                        if len(graph) >= entry["nodes"]:
+                        if len(graph) >= entry["nodes"] or not entry["brain_path"]:
                             entry["brain_path"] = db_path
-                            entry["game_name"] = meta.get("game_name", entry["game_name"])
+                            gname = meta.get("game_name", entry["game_name"])
+                            if gname and not gname.startswith("appid_"):
+                                entry["game_name"] = gname
                             entry["appid"] = str(meta.get("appid", entry["appid"]))
                             entry["nodes"] = len(graph)
                             entry["edges"] = int(
@@ -241,7 +328,6 @@ class VaultCacheMerger:
                     except (OSError, json.JSONDecodeError):
                         pass
 
-                # Collect precompiled files in hot_stripe_cache and shader_cache
                 seen_files = set(entry["cache_files"])
                 for sub in ("hot_stripe_cache", "shader_cache"):
                     sdir = os.path.join(g_vault, sub)
@@ -268,16 +354,12 @@ class VaultCacheMerger:
                     entry["top_chain"] = f"Precompiled: {sample_name} (+{len(entry['cache_files'])} cached)"
 
         return sorted(
-            entries_by_id.values(),
+            entries_by_appid.values(),
             key=lambda e: (len(e["cache_files"]), e["nodes"]),
             reverse=True
         )
 
     def prewarm_precompiled_caches(self, pinner, safe_id=None, bypass_cooldown=True):
-        """
-        Pre-pins precompiled caches (.foz, .pak, .bin, .esl, .esm) from
-        /run/media/$USER/preshader/recogd-vault into RAM using RamPinner.
-        """
         entries = self.discover_precompiled_caches()
         files_pinned = 0
         bytes_queued = 0
@@ -286,17 +368,17 @@ class VaultCacheMerger:
             if safe_id and entry["safe_id"] != safe_id and entry["appid"] != str(safe_id):
                 continue
             for fpath in entry["cache_files"]:
-                if bypass_cooldown:
+                if bypass_cooldown and hasattr(pinner, "cooldown_map"):
                     with pinner.lock:
                         pinner.cooldown_map.pop(fpath, None)
                 if pinner.request_pin(fpath):
                     files_pinned += 1
                     try:
-                        bytes_queued += min(os.path.getsize(fpath), pinner.max_size_bytes)
+                        max_b = getattr(pinner, "max_file_bytes", getattr(pinner, "max_size_bytes", 16777216))
+                        bytes_queued += min(os.path.getsize(fpath), max_b)
                     except OSError:
                         pass
 
-            # If this game also has a brain.json with existing target files on disk, pin top triggers
             if entry["brain_path"] and os.path.isfile(entry["brain_path"]):
                 try:
                     with open(entry["brain_path"], "r", encoding="utf-8") as f:
@@ -310,23 +392,23 @@ class VaultCacheMerger:
                     for parent_path, children in ranked_parents:
                         for candidate in [parent_path] + list(children.keys())[:3]:
                             if os.path.isfile(candidate):
-                                if bypass_cooldown:
+                                if bypass_cooldown and hasattr(pinner, "cooldown_map"):
                                     with pinner.lock:
                                         pinner.cooldown_map.pop(candidate, None)
                                 if pinner.request_pin(candidate):
                                     files_pinned += 1
                                     try:
-                                        bytes_queued += min(os.path.getsize(candidate), pinner.max_size_bytes)
+                                        max_b = getattr(pinner, "max_file_bytes", getattr(pinner, "max_size_bytes", 16777216))
+                                        bytes_queued += min(os.path.getsize(candidate), max_b)
                                     except OSError:
                                         pass
                 except (OSError, json.JSONDecodeError):
                     pass
 
-        # Also prewarm global shader cache directories across both vaults
         for root in self.active_vault_roots():
             for gdir in ("global_shader_cache", "dxvk_state_cache", "mesa_shader_cache"):
                 full_gdir = os.path.join(root, gdir)
-                if os.path.isdir(full_gdir):
+                if os.path.isdir(full_gdir) and hasattr(pinner, "prewarm_directory"):
                     files_pinned += pinner.prewarm_directory(full_gdir)
 
         return files_pinned, bytes_queued
