@@ -69,6 +69,10 @@ class AssetPinner:
         self.paused = False
         self.lock = threading.Lock()
 
+    @property
+    def stats(self):
+        return self.get_stats()
+
     def apply_live_config(self, cfg):
         with self.lock:
             self.governor.update_limits(
@@ -127,7 +131,14 @@ class AssetPinner:
                 pass
         return evicted_now
 
-    def pin_file(self, filepath, combat_burst_mode=False):
+    def request_pin(self, filepath, max_bytes_override=None, combat_burst_mode=False):
+        return self.pin_file(
+            filepath,
+            combat_burst_mode=combat_burst_mode,
+            max_bytes_override=max_bytes_override
+        )
+
+    def pin_file(self, filepath, combat_burst_mode=False, max_bytes_override=None):
         now = time.monotonic()
         with self.lock:
             if self.paused:
@@ -151,7 +162,8 @@ class AssetPinner:
             if not os.path.isfile(target_path):
                 return False
             st = os.stat(target_path)
-            if st.st_size <= 0 or st.st_size > self.max_file_bytes:
+            effective_max_file = max_bytes_override if max_bytes_override is not None else self.max_file_bytes
+            if st.st_size <= 0 or st.st_size > effective_max_file:
                 return False
 
             if combat_burst_mode and st.st_size > (6 * 1024 * 1024):

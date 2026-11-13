@@ -6,6 +6,13 @@ from collections import deque
 from velocity import PredictiveVelocityTracker
 from ram_governor import RamBudgetGovernor
 
+DEFAULT_EXTENSIONS = {
+    ".pbo", ".ebo", ".bsa", ".ba2", ".esm", ".esp", ".esl",
+    ".pak", ".foz", ".bin", ".upk", ".umap", ".uasset", ".ucas", ".utoc",
+    ".vpk", ".bundle", ".assets", ".resS", ".resource",
+    ".jar", ".mca", ".dat", ".nbt", ".zip", ".ogg", ".wav", ".bank"
+}
+
 
 class RecogEngine:
     def __init__(self, config, pinner, storage, velocity_tracker=None, ram_governor=None):
@@ -35,9 +42,10 @@ class RecogEngine:
         self.max_preload = int(eng_cfg.get("max_preload_children", 35))
         self.max_file_size_bytes = int(eng_cfg.get("max_file_size_bytes", 16777216))
         self.autosave_interval = float(eng_cfg.get("autosave_interval_seconds", 180))
-        self.allowed_exts = set(
+        cfg_exts = {
             ext.lower().strip() for ext in (config or {}).get("target_extensions", [])
-        )
+        }
+        self.allowed_exts = (cfg_exts | DEFAULT_EXTENSIONS) if cfg_exts else set(DEFAULT_EXTENSIONS)
 
     def is_valid_target(self, filepath):
         _, ext = os.path.splitext(filepath)
@@ -46,12 +54,13 @@ class RecogEngine:
         return os.path.isfile(filepath)
 
     def get_runtime_stats(self):
-        combined = dict(self.pinner.stats)
+        pinner_stats = self.pinner.get_stats() if hasattr(self.pinner, "get_stats") else getattr(self.pinner, "stats", {})
+        combined = dict(pinner_stats)
         combined["boost_triggers_fired"] = self.boost_triggers_fired
         combined["lookahead_pins_total"] = self.lookahead_pins_total
-        if self.velocity_tracker is not None:
+        if self.velocity_tracker is not None and hasattr(self.velocity_tracker, "get_stats"):
             combined.update(self.velocity_tracker.get_stats())
-        if self.ram_governor is not None:
+        if self.ram_governor is not None and hasattr(self.ram_governor, "get_stats"):
             combined.update(self.ram_governor.get_stats())
         return combined
 

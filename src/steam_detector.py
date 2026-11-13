@@ -14,6 +14,7 @@ IGNORED_APP_NAMES = {
 
 def sanitize_name(name):
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_")
+    cleaned = re.sub(r"_+", "_", cleaned)
     return cleaned or "UnknownGame"
 
 
@@ -90,12 +91,28 @@ class SteamGameDetector:
         except OSError:
             pass
 
+    def _extract_prism_instance_dir(self, raw_cmd):
+        mc_dir_m = re.search(r"--gameDir\s+([^\s\"']+)", raw_cmd)
+        if mc_dir_m and os.path.isdir(mc_dir_m.group(1)):
+            return os.path.abspath(mc_dir_m.group(1))
+
+        prism_m = re.search(r"(/[^\s\"']*PrismLauncher/instances/[^/\s\"']+)", raw_cmd)
+        if prism_m and os.path.isdir(prism_m.group(1)):
+            return os.path.abspath(prism_m.group(1))
+
+        default_prism = os.path.expanduser("~/.local/share/PrismLauncher")
+        if os.path.isdir(default_prism):
+            return default_prism
+        return os.path.expanduser("~")
+
     def detect_running_game(self):
         """
-        Scans /proc for any active Steam game launched by the current user.
+        Scans /proc for any active Steam game or PrismLauncher/Minecraft Java child process.
         Returns a game metadata dictionary if found, or None if no game is running.
         """
         uid = os.getuid()
+        fallback_candidate = None
+
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
                 continue
@@ -110,9 +127,41 @@ class SteamGameDetector:
                 if not raw_cmd:
                     continue
 
-                # Ignore Steam helper/runtime wrapper processes unless they point to a game
                 if "steamwebhelper" in raw_cmd or "preshader" in raw_cmd or "daemon.py" in raw_cmd:
                     continue
+
+                low_cmd = raw_cmd.lower()
+
+                # 0. Priority: Detect Minecraft Java child process or PrismLauncher
+                if "prismlauncher" in low_cmd or ("java" in low_cmd and ("minecraft" in low_cmd or "fml" in low_cmd or "fabric" in low_cmd or "neoforge" in low_cmd)):
+                    appid = "3546166962"
+                    env_path = os.path.join(entry.path, "environ")
+                    try:
+                        with open(env_path, "rb") as f:
+                            env_data = f.read().decode("utf-8", errors="ignore")
+                        reaper_m = re.search(r"AppId=(\d+)", raw_cmd)
+                        game_id_m = re.search(r"(?:^|\x00)SteamGameId=(\d+)", env_data)
+                        if reaper_m:
+                            appid = reaper_m.group(1)
+                        elif game_id_m and game_id_m.group(1) != "0":
+                            appid = game_id_m.group(1)
+                    except OSError:
+                        pass
+
+                    gdir = self._extract_prism_instance_dir(raw_cmd)
+                    prism_root = os.path.expanduser("~/.local/share/PrismLauncher")
+                    info = {
+                        "appid": appid,
+                        "name": "PrismLauncher",
+                        "safe_id": f"{appid}_PrismLauncher",
+                        "game_dir": gdir,
+                        "workshop_dir": os.path.join(prism_root, "libraries") if os.path.isdir(prism_root) else "",
+                        "shadercache_dir": os.path.join(prism_root, "assets") if os.path.isdir(prism_root) else ""
+                    }
+                    # If this is the active Java VM child process, return immediately
+                    if "java" in low_cmd:
+                        return info
+                    fallback_candidate = info
 
                 # 1. Check for AppID in Steam reaper command line (e.g. reaper SteamLaunch AppId=221100)
                 reaper_match = re.search(r"AppId=(\d+)", raw_cmd)
@@ -123,29 +172,34 @@ class SteamGameDetector:
                     if appid in self.manifests:
                         return self.manifests[appid]
 
-                # 2. Check /proc/<pid>/environ for SteamAppId when a game binary is active
-                if "steamapps/common/" in raw_cmd or ".exe" in raw_cmd.lower():
+                # 2. Check /proc/<pid>/environ for SteamAppId or SteamGameId when a game binary is active
+                if "steamapps/common/" in raw_cmd or ".exe" in low_cmd or "java" in low_cmd:
                     env_path = os.path.join(entry.path, "environ")
                     with open(env_path, "rb") as f:
                         env_data = f.read().decode("utf-8", errors="ignore")
 
                     app_m = re.search(r"(?:^|\x00)SteamAppId=(\d+)", env_data)
-                    if app_m:
+                    game_m = re.search(r"(?:^|\x00)SteamGameId=(\d+)", env_data)
+                    appid = None
+                    if app_m and app_m.group(1) != "0":
                         appid = app_m.group(1)
-                        if appid != "0":
-                            if appid not in self.manifests:
-                                self.refresh_libraries()
-                            if appid in self.manifests:
-                                return self.manifests[appid]
+                    elif game_m and game_m.group(1) != "0":
+                        appid = game_m.group(1)
 
-                            # Fallback if manifest wasn't parsed but install path is in environ
-                            compat_m = re.search(
-                                r"(?:^|\x00)STEAM_COMPAT_INSTALL_PATH=([^\x00]+)",
-                                env_data
-                            )
-                            if compat_m:
-                                gdir = compat_m.group(1)
-                                gname = os.path.basename(gdir.rstrip("/"))
+                    if appid:
+                        if appid not in self.manifests:
+                            self.refresh_libraries()
+                        if appid in self.manifests:
+                            return self.manifests[appid]
+
+                        compat_m = re.search(
+                            r"(?:^|\x00)STEAM_COMPAT_INSTALL_PATH=([^\x00]+)",
+                            env_data
+                        )
+                        if compat_m:
+                            gdir = compat_m.group(1)
+                            gname = os.path.basename(gdir.rstrip("/"))
+                            if gname and not gname.startswith("appid_"):
                                 return {
                                     "appid": appid,
                                     "name": gname,
@@ -176,4 +230,4 @@ class SteamGameDetector:
             except (OSError, PermissionError):
                 continue
 
-        return None
+        return fallback_candidate
