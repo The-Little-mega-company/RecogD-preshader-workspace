@@ -28,7 +28,7 @@ auto_mount_external_ssd() {
         fi
     done
 
-    # 3. Locate the 'preshader' ext4 partition (e.g. /dev/sda4)
+    # 3. Locate the 'preshader' ext4 partition
     DEV_NODE=""
     if [ -e "/dev/disk/by-label/$DRIVE_LABEL" ]; then
         DEV_NODE="$(readlink -f "/dev/disk/by-label/$DRIVE_LABEL")"
@@ -44,9 +44,6 @@ auto_mount_external_ssd() {
         return 1
     fi
 
-    echo "[PRESHADER-MOUNT] Found external ext4 partition: $DEV_NODE (LABEL=$DRIVE_LABEL)"
-
-    # Prefer rootless udisksctl first
     if command -v udisksctl >/dev/null 2>&1; then
         udisksctl mount -b "$DEV_NODE" --options noatime --no-user-interaction >/dev/null 2>&1 || true
         ACTUAL_MNT="$(lsblk -no MOUNTPOINT "$DEV_NODE" | head -n 1)"
@@ -56,21 +53,22 @@ auto_mount_external_ssd() {
         fi
     fi
 
-    # Fallback to sudo mount to /mnt/preshader
-    echo "[PRESHADER-MOUNT] Mounting $DEV_NODE to $DRIVE_MOUNT..."
-    sudo mkdir -p "$DRIVE_MOUNT"
-    sudo mount -o defaults,noatime,nodiratime "$DEV_NODE" "$DRIVE_MOUNT"
-    mountpoint -q "$DRIVE_MOUNT" 2>/dev/null
+    if sudo -n true 2>/dev/null; then
+        sudo mkdir -p "$DRIVE_MOUNT"
+        sudo mount -o defaults,noatime,nodiratime "$DEV_NODE" "$DRIVE_MOUNT" 2>/dev/null || true
+        if mountpoint -q "$DRIVE_MOUNT" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 if auto_mount_external_ssd; then
-    # Newly formatted ext4 partitions belong to root by default — grant user ownership automatically
-    if [ ! -w "$DRIVE_MOUNT" ]; then
-        echo "[PRESHADER-MOUNT] Fixing ext4 ownership on $DRIVE_MOUNT for user $USER..."
-        sudo chown -R "$USER:$USER" "$DRIVE_MOUNT"
+    if [ ! -w "$DRIVE_MOUNT" ] && sudo -n true 2>/dev/null; then
+        sudo chown -R "$USER:$USER" "$DRIVE_MOUNT" 2>/dev/null || true
     fi
 
-    # Tune USB block read-ahead queue if passwordless sudo is active
     DEV_SRC="$(findmnt -n -o SOURCE "$DRIVE_MOUNT" 2>/dev/null || true)"
     if [ -n "$DEV_SRC" ]; then
         BASE_BLOCK="$(basename "$DEV_SRC" | sed 's/[0-9]*$//')"
@@ -81,20 +79,28 @@ if auto_mount_external_ssd; then
     fi
 
     VAULT_DIR="$DRIVE_MOUNT/recogd-vault"
-    echo "[PRESHADER] Dual-Bus Mode ONLINE: Internal NVMe + External Ext4 SSD ($DRIVE_MOUNT)"
 else
     VAULT_DIR="$FALLBACK_VAULT"
-    echo "[PRESHADER] External 'preshader' partition not detected. Using Internal NVMe Fallback ($VAULT_DIR)"
 fi
 
-mkdir -p "$VAULT_DIR/games" "$VAULT_DIR/global_shader_cache"
+mkdir -p "$VAULT_DIR/games" "$VAULT_DIR/global_shader_cache" 2>/dev/null || true
 
 export MESA_SHADER_CACHE_DIR="$VAULT_DIR/global_shader_cache"
 export MESA_SHADER_CACHE_MAX_SIZE="10G"
 export DXVK_STATE_CACHE_PATH="$VAULT_DIR/global_shader_cache"
 export RADV_PERFTEST="gpl"
 
-# Run daemon in foreground so live detections stream directly to Konsole and Ctrl+C stops cleanly
-exec python3 "$WORKSPACE_DIR/src/daemon.py" \
-    --vault-root "$VAULT_DIR" \
-    --ext-mount "$DRIVE_MOUNT"
+if [ "${1:-}" = "--nogui" ]; then
+    shift
+    exec python3 "$WORKSPACE_DIR/src/daemon.py" \
+        --vault-root "$VAULT_DIR" \
+        --ext-mount "$DRIVE_MOUNT" \
+        "$@"
+fi
+
+if [ "${1:-}" = "--gui" ] || [ "${1:-}" = "gui" ] || [ "${1:-}" = "--show-gui" ]; then
+    shift
+fi
+
+# Unified Single-Process Mode (runs Daemon + Control Deck GUI + Permanent System Tray in 1 process)
+exec python3 "$WORKSPACE_DIR/src/ui.py" "$@"

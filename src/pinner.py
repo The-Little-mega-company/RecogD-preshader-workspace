@@ -9,13 +9,15 @@ POSIX_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
 
 
 class RamBudgetGovernor:
-    def __init__(self, max_ram_fraction=0.30, min_free_mb=2560):
-        self.max_ram_fraction = max_ram_fraction
-        self.min_free_bytes = min_free_mb * 1024 * 1024
-        self.total_ram_bytes = self._read_meminfo_bytes("MemTotal") or (16 * 1024 * 1024 * 1024)
-        self.max_budget_bytes = int(self.total_ram_bytes * self.max_ram_fraction)
+    def __init__(self, max_cache_mb=1536, min_free_mb=4500):
+        self.max_budget_bytes = int(max_cache_mb * 1024 * 1024)
+        self.min_free_bytes = int(min_free_mb * 1024 * 1024)
         self.last_check = 0.0
-        self.cached_avail = self.total_ram_bytes
+        self.cached_avail = 8 * 1024 * 1024 * 1024
+
+    def update_limits(self, max_cache_mb, min_free_mb):
+        self.max_budget_bytes = int(max(256, min(4096, int(max_cache_mb))) * 1024 * 1024)
+        self.min_free_bytes = int(max(2048, min(8192, int(min_free_mb))) * 1024 * 1024)
 
     def _read_meminfo_bytes(self, key):
         try:
@@ -30,7 +32,7 @@ class RamBudgetGovernor:
 
     def get_available_ram(self):
         now = time.monotonic()
-        if (now - self.last_check) > 2.5:
+        if (now - self.last_check) > 0.8:
             avail = self._read_meminfo_bytes("MemAvailable")
             if avail > 0:
                 self.cached_avail = avail
@@ -44,13 +46,18 @@ class RamBudgetGovernor:
 
 
 class AssetPinner:
-    def __init__(self, storage, max_file_mb=64):
+    def __init__(self, storage, max_file_mb=16):
         self.storage = storage
+        # Strict 16MB file cap prevents massive DayZ .pbo or Skyrim .bsa files from choking RAM
         self.max_file_bytes = max_file_mb * 1024 * 1024
-        self.governor = RamBudgetGovernor(max_ram_fraction=0.30, min_free_mb=2560)
+        self.governor = RamBudgetGovernor(max_cache_mb=1536, min_free_mb=4500)
 
         self.active_pins = OrderedDict()
         self.current_pinned_bytes = 0
+
+        self.window_start = time.monotonic()
+        self.bytes_pinned_in_window = 0
+        self.max_pin_bps_normal = 24 * 1024 * 1024
 
         self.nvme_files = 0
         self.nvme_bytes = 0
@@ -59,7 +66,42 @@ class AssetPinner:
         self.evicted_files = 0
         self.evicted_bytes = 0
         self.toggle_counter = 0
+        self.paused = False
         self.lock = threading.Lock()
+
+    def apply_live_config(self, cfg):
+        with self.lock:
+            self.governor.update_limits(
+                cfg.get("max_cache_mb", 1536),
+                cfg.get("min_free_ram_mb", 4500)
+            )
+            self.paused = bool(cfg.get("pause_engine", False))
+            self._evict_oldest_until_safe(needed_bytes=0)
+
+    def enforce_memory_safety(self):
+        """Called every second by daemon loop to release RAM before game can crash."""
+        with self.lock:
+            return self._evict_oldest_until_safe(needed_bytes=0)
+
+    def flush_all_pins(self):
+        with self.lock:
+            count = 0
+            while self.active_pins:
+                old_path, (old_size, _) = self.active_pins.popitem(last=False)
+                self.current_pinned_bytes = max(0, self.current_pinned_bytes - old_size)
+                self.evicted_files += 1
+                self.evicted_bytes += old_size
+                count += 1
+                try:
+                    if os.path.isfile(old_path):
+                        fd = os.open(old_path, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+                        try:
+                            os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+                        finally:
+                            os.close(fd)
+                except OSError:
+                    pass
+            return count
 
     def _evict_oldest_until_safe(self, needed_bytes=0):
         evicted_now = 0
@@ -85,8 +127,19 @@ class AssetPinner:
                 pass
         return evicted_now
 
-    def pin_file(self, filepath):
+    def pin_file(self, filepath, combat_burst_mode=False):
+        now = time.monotonic()
         with self.lock:
+            if self.paused:
+                return False
+            if (now - self.window_start) >= 1.0:
+                self.window_start = now
+                self.bytes_pinned_in_window = 0
+
+            current_cap = (8 * 1024 * 1024) if combat_burst_mode else self.max_pin_bps_normal
+            if self.bytes_pinned_in_window >= current_cap:
+                return False
+
             if filepath in self.active_pins:
                 self.active_pins.move_to_end(filepath)
                 return False
@@ -99,6 +152,9 @@ class AssetPinner:
                 return False
             st = os.stat(target_path)
             if st.st_size <= 0 or st.st_size > self.max_file_bytes:
+                return False
+
+            if combat_burst_mode and st.st_size > (6 * 1024 * 1024):
                 return False
 
             with self.lock:
@@ -118,12 +174,16 @@ class AssetPinner:
             finally:
                 os.close(fd)
 
-            is_external = target_path.startswith(self.storage.external_mount)
+            is_external = (
+                self.storage.external_online
+                and target_path.startswith(self.storage.external_mount)
+            )
             bus_type = "sata" if is_external else "nvme"
 
             with self.lock:
                 self.active_pins[target_path] = (st.st_size, bus_type)
                 self.current_pinned_bytes += st.st_size
+                self.bytes_pinned_in_window += st.st_size
                 if is_external:
                     self.sata_files += 1
                     self.sata_bytes += st.st_size

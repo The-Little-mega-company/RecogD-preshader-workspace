@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 import os
 import json
+import glob
 
 
 def find_vault_dirs():
-    user = os.environ.get("USER", "kessiathecreator")
-    candidates = [
-        f"/run/media/{user}/preshader/recogd-vault",
-        f"/var/run/media/{user}/preshader/recogd-vault",
-        f"/media/{user}/preshader/recogd-vault",
-        "/mnt/preshader/recogd-vault",
+    candidates = []
+    for pattern in (
+        "/run/media/*/*/recogd-vault",
+        "/var/run/media/*/*/recogd-vault",
+        "/media/*/*/recogd-vault",
+        "/mnt/*/recogd-vault",
         os.path.expanduser("~/.cache/recogd-fallback")
-    ]
-    found = []
-    for c in candidates:
-        games_dir = os.path.join(c, "games")
-        if os.path.isdir(games_dir):
-            found.append(games_dir)
-    return found
+    ):
+        for match in glob.glob(pattern):
+            games_dir = os.path.join(match, "games")
+            if os.path.isdir(games_dir):
+                candidates.append(games_dir)
+    return candidates
 
 
 def main():
@@ -79,14 +79,16 @@ def main():
         peak_vel = sstats.get("peak_velocity_per_sec", 0.0)
         max_hop = sstats.get("max_hop_depth_used", 1)
         active_ram = sstats.get("active_ram_pinned_mb", 0.0)
-        budget_ram = sstats.get("ram_budget_ceiling_mb", 0.0)
+        budget_ram = sstats.get("ram_budget_ceiling_mb", 1536.0)
         avail_ram = sstats.get("system_avail_ram_mb", 0.0)
         evicted_f = sstats.get("governor_evicted_files", 0)
         evicted_mb = sstats.get("governor_evicted_mb", 0.0)
+        shed_writes = sstats.get("burst_writes_shed", 0)
 
         print(f"Predictive Velocity:    Peak {peak_vel:.1f} triggers/sec (Max Hop Depth: {max_hop} hops)")
-        print(f"RAM Budget Governor:    {active_ram:.2f} MB active / {budget_ram:.2f} MB cap (Sys Avail: {avail_ram:.2f} MB)")
-        print(f"  └─ Pressure Evictions:{evicted_f} files released ({evicted_mb:.2f} MB freed via DONTNEED)")
+        print(f"RAM Budget Governor:    {active_ram:.2f} MB active / {budget_ram:.0f} MB cap (Sys Free: {avail_ram:.0f} MB)")
+        print(f"  ├─ OOM Guard Evicted: {evicted_f} files released ({evicted_mb:.2f} MB freed via DONTNEED)")
+        print(f"  └─ Spike Shield Shed: {shed_writes} heavy writes aborted to protect FPS")
 
         if graph:
             print("Top 5 Reinforced Asset Triggers:")

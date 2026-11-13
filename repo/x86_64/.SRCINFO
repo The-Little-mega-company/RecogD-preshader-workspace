@@ -1,0 +1,19 @@
+pkgbase = preshader
+	pkgdesc = RecogD Preshader Unified Control Deck: Predictive Game Asset Preloader, Dual-Bus Vault Merger & Dynamic RAM Budget Governor
+	pkgver = 2.0.0
+	pkgrel = 1
+	url = https://github.com/The-Little-mega-company/precog-workspace
+	install = preshader.install
+	arch = any
+	license = MIT
+	depends = python
+	depends = tk
+	depends = python-pyqt6
+	optdepends = steam: automatic Steam game library detection
+	provides = preshader
+	provides = recogd-preshader
+	conflicts = preshader-git
+	source = recogd-preshader-unified.tar.gz
+	sha256sums = SKIP
+
+pkgname = preshader
