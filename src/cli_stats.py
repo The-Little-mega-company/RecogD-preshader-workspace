@@ -3,6 +3,27 @@ import os
 import json
 import glob
 from vault_merger import VaultCacheMerger
+import config_ipc
+
+
+def print_current_runtime():
+    state = config_ipc.read_live_state()
+    if not state.get("daemon_online", False):
+        return False
+
+    game_name = state.get("game_name", "Waiting for game")
+    appid = state.get("appid", "-")
+    status = state.get("status_text", "RUNNING")
+    print(f">>> CURRENT RUNTIME: {game_name} (AppID: {appid}) — {status} <<<")
+    if appid != "-":
+        print(
+            "Event queue: "
+            f"{state.get('events_processed', 0)} processed, "
+            f"{state.get('events_dropped', 0)} dropped, "
+            f"{state.get('event_queue_depth', 0)} queued"
+        )
+    print()
+    return True
 
 
 def find_vault_dirs():
@@ -26,6 +47,8 @@ def find_vault_dirs():
 
 
 def main():
+    runtime_online = print_current_runtime()
+
     # Automatically merge fallback and duplicate AppID folders before reporting
     try:
         merger = VaultCacheMerger()
@@ -64,7 +87,8 @@ def main():
                 brains_by_appid[appid] = (is_external, node_count, db_path, data)
 
     if not brains_by_appid:
-        print("[STATS] No per-game brain databases found yet. Run 'preshader' and launch any Steam game!")
+        if not runtime_online:
+            print("[STATS] No per-game brain databases found yet. Run 'preshader' and launch a Steam or PrismLauncher game!")
         return
 
     print("==========================================================")

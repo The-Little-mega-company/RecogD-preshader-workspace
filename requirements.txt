@@ -1,2 +1,1 @@
-Pillow>=10.0
-pystray>=0.19
+# Runtime dependencies are provided by Arch packages; see README.md.

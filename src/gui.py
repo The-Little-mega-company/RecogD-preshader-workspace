@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
-import os
+import subprocess
+import threading
 # Force working directory to script location so relative assets resolve properly
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.chdir("..")
@@ -22,9 +23,18 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import config_ipc
+from benchmark import format_gui_summary, run_benchmark
 
 APP_INDICATOR = None
-for mod_name in ("AyatanaAppIndicator3", "AppIndicator3"):
+IS_WAYLAND_SESSION = (
+    bool(os.environ.get("WAYLAND_DISPLAY"))
+    or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+)
+indicator_modules = ("AyatanaAppIndicator3",) if IS_WAYLAND_SESSION else (
+    "AyatanaAppIndicator3",
+    "AppIndicator3"
+)
+for mod_name in indicator_modules:
     try:
         gi.require_version(mod_name, "0.1")
         APP_INDICATOR = getattr(gi.repository, mod_name)
@@ -103,6 +113,17 @@ progress, highlight {
 """
 
 
+def read_mem_total_mb():
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemTotal:"):
+                    return max(1, int(line.split()[1]) // 1024)
+    except (OSError, ValueError):
+        pass
+    return 8192
+
+
 def create_tray_icons():
     uid = os.getuid()
     palette = {
@@ -152,12 +173,15 @@ class SimpleControlDeck(Gtk.Window):
         )
 
         self.cfg = config_ipc.read_live_config()
+        self.last_gui_show_request = ""
+        self.mem_total_mb = read_mem_total_mb()
+        self.daemon_start_process = None
+        self.benchmark_running = False
         self.current_icon = "standby"
         self.connect("delete-event", self._on_close_to_tray)
 
         self._build_layout()
         self._setup_tray()
-        self._poll_state()
         GLib.timeout_add(500, self._poll_state)
 
     def _build_layout(self):
@@ -165,9 +189,14 @@ class SimpleControlDeck(Gtk.Window):
         self.add(vbox)
 
         # 1. Top Status Banner
+        self.banner_event = Gtk.EventBox()
+        self.banner_event.connect("button-press-event", self._start_daemon_on_banner)
+        self.banner_event.set_tooltip_text("Click here to start RecogD if the daemon is offline")
+        vbox.pack_start(self.banner_event, False, False, 0)
+
         self.banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.banner.get_style_context().add_class("banner-normal")
-        vbox.pack_start(self.banner, False, False, 0)
+        self.banner_event.add(self.banner)
 
         self.lbl_title = Gtk.Label(label="RECOGD PRESHADER — DIRECT DECK")
         self.lbl_title.get_style_context().add_class("title-text")
@@ -181,6 +210,11 @@ class SimpleControlDeck(Gtk.Window):
         self.lbl_game = Gtk.Label(label="Game: Waiting for Steam game...")
         self.lbl_game.set_xalign(0.0)
         self.banner.pack_start(self.lbl_game, False, False, 0)
+
+        self.lbl_benchmark = Gtk.Label(label="Drive benchmark: Not run")
+        self.lbl_benchmark.set_xalign(0.0)
+        self.lbl_benchmark.set_line_wrap(True)
+        self.banner.pack_start(self.lbl_benchmark, False, False, 0)
 
         # 2. Live Metrics Box
         metrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -202,6 +236,14 @@ class SimpleControlDeck(Gtk.Window):
         self.lbl_vel = Gtk.Label(label="Velocity: 0.0/s (1 Hop)   |   OOM Evicted: 0 MB   |   Spike Shed: 0")
         self.lbl_vel.set_xalign(0.0)
         metrics_box.pack_start(self.lbl_vel, False, False, 0)
+
+        self.lbl_last_pin = Gtk.Label(label="Last Pin: —")
+        self.lbl_last_pin.set_xalign(0.0)
+        metrics_box.pack_start(self.lbl_last_pin, False, False, 0)
+
+        self.lbl_events = Gtk.Label(label="Events: 0 processed | 0 merged | 0 dropped | 0 queued | 0 errors")
+        self.lbl_events.set_xalign(0.0)
+        metrics_box.pack_start(self.lbl_events, False, False, 0)
 
         # 3. Direct Action Buttons (2x2 Grid)
         btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -230,21 +272,32 @@ class SimpleControlDeck(Gtk.Window):
         btn_tray.connect("clicked", lambda *_: self.hide())
         row2.pack_start(btn_tray, True, True, 0)
 
+        self.btn_benchmark = Gtk.Button(label="Benchmark Drives")
+        self.btn_benchmark.set_tooltip_text(
+            "Runs a 2-second direct read/write test per drive using temporary files."
+        )
+        self.btn_benchmark.connect("clicked", self._start_bus_benchmark)
+        btn_box.pack_start(self.btn_benchmark, False, False, 0)
+
         # 4. Essential Sliders Only (3 Direct Sliders)
         sliders_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         sliders_box.get_style_context().add_class("panel-box")
         vbox.pack_start(sliders_box, True, True, 0)
 
+        max_cache_mb = max(64, int(self.mem_total_mb * 0.25))
+        min_cache_mb = min(256, max_cache_mb)
+        max_free_ram_mb = max(64, int(self.mem_total_mb * 0.50))
+        min_free_ram_mb = min(1500, max_free_ram_mb)
         self.slider_cache = self._create_slider(
             sliders_box,
             "Max Pinned Cache Cap (MB):",
-            256, 3072, 128,
+            min_cache_mb, max_cache_mb, 128,
             self.cfg.get("max_cache_mb", 1536)
         )
         self.slider_free_ram = self._create_slider(
             sliders_box,
             "Protected Free System RAM Floor (MB) [Prevents Crashes]:",
-            3000, 7000, 250,
+            min_free_ram_mb, max_free_ram_mb, 250,
             self.cfg.get("min_free_ram_mb", 4500)
         )
         self.slider_hops = self._create_slider(
@@ -253,6 +306,12 @@ class SimpleControlDeck(Gtk.Window):
             1, 3, 1,
             self.cfg.get("max_hop_depth", 2)
         )
+        bounded_values = {
+            "max_cache_mb": int(self.slider_cache.get_value()),
+            "min_free_ram_mb": int(self.slider_free_ram.get_value())
+        }
+        if any(self.cfg.get(key) != value for key, value in bounded_values.items()):
+            self.cfg = config_ipc.update_live_config(bounded_values, save_persistent=True)
 
     def _create_slider(self, parent, title, lo, hi, step, val):
         lbl = Gtk.Label(label=title)
@@ -315,13 +374,15 @@ class SimpleControlDeck(Gtk.Window):
             except Exception:
                 self.indicator = None
 
-        if self.indicator is None:
+        if self.indicator is None and not IS_WAYLAND_SESSION:
             self.status_icon = Gtk.StatusIcon()
             self.status_icon.set_from_file(self.icons["standby"])
             self.status_icon.set_tooltip_text("RecogD Preshader Control Deck")
             self.status_icon.connect("activate", self._toggle_window)
             self.status_icon.connect("popup-menu", self._on_tray_popup)
             self.status_icon.set_visible(True)
+        elif self.indicator is None:
+            print("[GUI-WARN] Ayatana AppIndicator is unavailable; tray icon disabled on Wayland.")
 
     def _update_tray_icon(self, key):
         if key == self.current_icon:
@@ -353,6 +414,25 @@ class SimpleControlDeck(Gtk.Window):
         self.hide()
         return True
 
+    def _start_daemon_on_banner(self, _widget, event):
+        if event.button != 1 or config_ipc.read_live_state().get("daemon_online", False):
+            return False
+        if self.daemon_start_process is not None and self.daemon_start_process.poll() is None:
+            return True
+
+        launcher = os.path.join(WORKSPACE_DIR, "scripts", "recogd-launch.sh")
+        try:
+            self.daemon_start_process = subprocess.Popen(
+                ["bash", launcher, "--nogui"],
+                cwd=WORKSPACE_DIR,
+                start_new_session=True
+            )
+        except OSError as exc:
+            self.lbl_status.set_text(f"State: Could not start daemon ({exc})")
+            return True
+        self.lbl_status.set_text("State: Starting daemon...")
+        return True
+
     def _toggle_shield(self, *_):
         cfg = config_ipc.read_live_config()
         new_state = not cfg.get("force_combat_shield", False)
@@ -370,6 +450,43 @@ class SimpleControlDeck(Gtk.Window):
         gen = int(cfg.get("flush_generation", 0)) + 1
         self.cfg = config_ipc.update_live_config({"flush_generation": gen}, save_persistent=False)
 
+    def _start_bus_benchmark(self, *_):
+        if self.benchmark_running:
+            return
+        self.benchmark_running = True
+        self.btn_benchmark.set_sensitive(False)
+        self.btn_benchmark.set_label("Benchmarking...")
+        self.lbl_benchmark.set_text("Measuring both drives with temporary test files...")
+
+        def run():
+            report = run_benchmark()
+            GLib.idle_add(self._finish_bus_benchmark, report)
+
+        threading.Thread(target=run, name="PreshaderBenchmark", daemon=True).start()
+
+    def _finish_bus_benchmark(self, report):
+        self.benchmark_running = False
+        self.btn_benchmark.set_sensitive(True)
+        self.btn_benchmark.set_label("Benchmark Drives")
+        self.lbl_benchmark.set_text(format_gui_summary(report))
+        details = []
+        if report.nvme.error:
+            details.append(f"NVMe: {report.nvme.error}")
+        if report.external.error:
+            details.append(f"External SSD: {report.external.error}")
+        if report.nvme.cleanup_warning:
+            details.append(report.nvme.cleanup_warning)
+        if report.external.cleanup_warning:
+            details.append(report.external.cleanup_warning)
+        if report.calibration_error:
+            details.append(f"Write-cap calibration: {report.calibration_error}")
+        if details:
+            self.lbl_benchmark.set_tooltip_text("\n".join(details))
+        else:
+            self.lbl_benchmark.set_tooltip_text("Read/write throughput in MB/s")
+        self.cfg = config_ipc.read_live_config()
+        return False
+
     def _on_slider_changed(self, *_):
         updates = {
             "max_cache_mb": int(self.slider_cache.get_value()),
@@ -385,6 +502,11 @@ class SimpleControlDeck(Gtk.Window):
     def _poll_state(self):
         state = config_ipc.read_live_state()
         self.cfg = config_ipc.read_live_config()
+        show_request = self.cfg.get("show_gui_request", "")
+        if show_request and show_request != self.last_gui_show_request:
+            self.last_gui_show_request = show_request
+            self.deiconify()
+            self.present()
 
         shield_locked = bool(self.cfg.get("force_combat_shield", False))
         paused = bool(self.cfg.get("pause_engine", False))
@@ -427,6 +549,10 @@ class SimpleControlDeck(Gtk.Window):
         self.lbl_status.set_text(
             f"State: {state.get('status_text', 'STANDBY')}  |  Vault: {state.get('vault_mode', 'Auto')}"
         )
+        if not state.get("daemon_online", False):
+            self.lbl_status.set_text(
+                f"State: {state.get('status_text', 'DAEMON OFFLINE')}  |  Click banner to start"
+            )
         self.lbl_game.set_text(
             f"Game: {state.get('game_name', 'None')} (AppID: {state.get('appid', '-')})"
         )
@@ -448,13 +574,30 @@ class SimpleControlDeck(Gtk.Window):
             f"Velocity: {state.get('velocity', 0.0):.1f}/s ({state.get('hop_depth', 1)} Hops)   |   "
             f"OOM Evicted: {state.get('evicted_mb', 0.0):.1f} MB   |   Spike Shed: {state.get('shed_writes', 0)}"
         )
+        last_pin = state.get("last_pinned_file") or "—"
+        self.lbl_last_pin.set_text(f"Last Pin: {last_pin}")
+        self.lbl_events.set_text(
+            "Events: "
+            f"{state.get('events_processed', 0)} processed | "
+            f"{state.get('events_coalesced', 0)} merged | "
+            f"{state.get('events_dropped', 0)} dropped | "
+            f"{state.get('event_queue_depth', 0)} queued | "
+            f"{state.get('event_processing_errors', 0)} errors | "
+            f"{state.get('inotify_overflows', 0)} kernel overflows"
+        )
         return True
 
 
 def main():
     win = SimpleControlDeck()
     win.show_all()
-    Gtk.main()
+    if "--minimized" in sys.argv[1:]:
+        win.hide()
+    win._poll_state()
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        Gtk.main_quit()
 
 
 if __name__ == "__main__":

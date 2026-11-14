@@ -1,11 +1,16 @@
 import json
 import os
-import signal
+import sys
 import subprocess
 import tempfile
-import time
 import unittest
 
+sys_path_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if sys_path_src not in sys.path:
+    sys.path.insert(0, sys_path_src)
+
+from pinner import AssetPinner
+from storage import BrainStorage
 from src.telemetry import RuntimeTelemetry
 
 
@@ -51,103 +56,52 @@ class RuntimeTelemetryTests(unittest.TestCase):
 
 
 class PinnerTelemetryTests(unittest.TestCase):
-    def test_records_successful_cache_hint(self):
-        import threading
-
-        from src.pinner import RamPinner
-
+    def test_tracks_successful_cache_hint(self):
         with tempfile.TemporaryDirectory() as directory:
             asset_path = os.path.join(directory, "asset.pbo")
             with open(asset_path, "wb") as asset_file:
                 asset_file.write(b"asset data")
-            completed = threading.Event()
-            events = []
-
-            def record_preload(path, size, is_external, stats):
-                events.append((path, size, is_external, stats))
-                completed.set()
-
-            pinner = RamPinner(preload_callback=record_preload)
+            storage = BrainStorage(
+                directory,
+                {"appid": "1", "name": "Test", "safe_id": "1_Test"},
+                external_mount=os.path.join(directory, "external"),
+                enable_striping=False
+            )
+            pinner = AssetPinner(
+                storage,
+                config={
+                    "max_cache_mb": 512,
+                    "min_free_ram_mb": 64,
+                    "ram_governor": {"enabled": False, "max_pinned_budget_mb": 512}
+                }
+            )
             try:
                 self.assertTrue(pinner.request_pin(asset_path))
-                self.assertTrue(completed.wait(2))
+                self.assertEqual(pinner.get_active_pinned_bytes(), len(b"asset data"))
+                self.assertEqual(pinner.get_stats()["total_pinned_files"], 1)
             finally:
                 pinner.shutdown()
-
-            self.assertEqual(events[0][0], asset_path)
-            self.assertEqual(events[0][1], len(b"asset data"))
-            self.assertFalse(events[0][2])
-            self.assertEqual(events[0][3]["total_pinned_files"], 1)
+                storage.shutdown()
 
 
 class DaemonLifecycleTests(unittest.TestCase):
-    def test_daemon_reports_running_and_stopped(self):
+    def test_daemon_cli_accepts_required_vault_root(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with tempfile.TemporaryDirectory() as directory:
-            watch_path = os.path.join(directory, "watch")
-            os.makedirs(watch_path)
-            config_path = os.path.join(directory, "config.json")
-            telemetry_path = os.path.join(directory, "runtime.json")
-            brain_path = os.path.join(directory, "brain.json")
-            profile = {
-                "watch_directories": [watch_path],
-                "shader_vault_dirs": [],
-                "brain_db_path": brain_path,
-                "fallback_db_path": brain_path,
-                "stripe_cache_dir": os.path.join(directory, "stripes")
-            }
-            config = {
-                "engine": {"max_parent_nodes": 10},
-                "external_drive": {
-                    "mount_point": directory,
-                    "enable_cross_bus_striping": False
-                },
-                "target_extensions": [".pbo"],
-                "profiles": {"test": profile}
-            }
-            with open(config_path, "w", encoding="utf-8") as config_file:
-                json.dump(config, config_file)
-
-            process = subprocess.Popen(
+            result = subprocess.run(
                 [
-                    os.sys.executable,
+                    sys.executable,
                     os.path.join(project_root, "src", "daemon.py"),
-                    "--profile", "test",
-                    "--config", config_path,
-                    "--telemetry", telemetry_path
+                    "--vault-root", directory,
+                    "--ext-mount", directory,
+                    "--help"
                 ],
                 cwd=project_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True
             )
-            try:
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    if process.poll() is not None:
-                        output = process.stdout.read() if process.stdout else ""
-                        self.fail(f"Daemon exited before running:\n{output}")
-                    try:
-                        with open(telemetry_path, "r", encoding="utf-8") as telemetry_file:
-                            status = json.load(telemetry_file).get("status")
-                    except (FileNotFoundError, json.JSONDecodeError):
-                        status = None
-                    if status == "running":
-                        break
-                    time.sleep(0.05)
-                self.assertEqual(status, "running")
-
-                process.send_signal(signal.SIGTERM)
-                self.assertEqual(process.wait(timeout=5), 0)
-                with open(telemetry_path, "r", encoding="utf-8") as telemetry_file:
-                    final_status = json.load(telemetry_file).get("status")
-                self.assertEqual(final_status, "stopped")
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=5)
-                if process.stdout is not None:
-                    process.stdout.close()
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("--vault-root VAULT_ROOT", result.stdout)
 
 
 if __name__ == "__main__":

@@ -2,14 +2,21 @@
 import os
 import json
 import time
+import uuid
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PERSISTENT_CONFIG_PATH = os.path.join(WORKSPACE_DIR, "config.json")
+XDG_CONFIG_HOME = os.environ.get(
+    "XDG_CONFIG_HOME",
+    os.path.join(os.path.expanduser("~"), ".config")
+)
+PERSISTENT_CONFIG_PATH = os.path.join(XDG_CONFIG_HOME, "recogd", "config.json")
+LEGACY_CONFIG_PATH = os.path.join(WORKSPACE_DIR, "config.json")
 LIVE_CONFIG_PATH = f"/dev/shm/recogd_config_{os.getuid()}.json"
 LIVE_STATE_PATH = f"/dev/shm/recogd_state_{os.getuid()}.json"
 
 DEFAULT_CONFIG = {
     "max_cache_mb": 1536,
+    "app_ram_caps_mb": {},
     "min_free_ram_mb": 4500,
     "max_hop_depth": 2,
     "shield_velocity_threshold": 18.0,
@@ -17,6 +24,7 @@ DEFAULT_CONFIG = {
     "force_combat_shield": False,
     "pause_engine": False,
     "flush_generation": 0,
+    "show_gui_request": "",
     "shutdown_requested": False
 }
 
@@ -41,11 +49,20 @@ DEFAULT_STATE = {
     "evicted_files": 0,
     "evicted_mb": 0.0,
     "shed_writes": 0,
-    "io_stall_pct": 0.0
+    "io_stall_pct": 0.0,
+    "last_pinned_file": "",
+    "events_received": 0,
+    "events_processed": 0,
+    "events_coalesced": 0,
+    "events_dropped": 0,
+    "event_processing_errors": 0,
+    "event_queue_depth": 0,
+    "inotify_overflows": 0
 }
 
 
 def _atomic_write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -74,12 +91,19 @@ def _read_json(path, fallback):
 
 
 def init_live_config():
-    saved = _read_json(PERSISTENT_CONFIG_PATH, DEFAULT_CONFIG)
+    saved = read_persistent_config()
     saved["force_combat_shield"] = False
     saved["pause_engine"] = False
+    saved["show_gui_request"] = ""
     saved["shutdown_requested"] = False
     _atomic_write_json(LIVE_CONFIG_PATH, saved)
     return saved
+
+
+def read_persistent_config():
+    if os.path.exists(PERSISTENT_CONFIG_PATH):
+        return _read_json(PERSISTENT_CONFIG_PATH, DEFAULT_CONFIG)
+    return _read_json(LEGACY_CONFIG_PATH, DEFAULT_CONFIG)
 
 
 def read_live_config():
@@ -99,6 +123,12 @@ def update_live_config(updates, save_persistent=True):
         persistent_copy["shutdown_requested"] = False
         _atomic_write_json(PERSISTENT_CONFIG_PATH, persistent_copy)
     return cfg
+
+
+def request_gui_show():
+    request_id = uuid.uuid4().hex
+    update_live_config({"show_gui_request": request_id}, save_persistent=False)
+    return request_id
 
 
 def write_live_state(state_updates):
