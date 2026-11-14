@@ -1,18 +1,18 @@
 # Maintainer: Kess <171630615+KessiaTheCreator@users.noreply.github.com>
 pkgname=preshader
 pkgver=2.0.0
-pkgrel=1
+pkgrel=14
 pkgdesc="RecogD Preshader Unified Control Deck: Predictive Game Asset Preloader, Dual-Bus Vault Merger & Dynamic RAM Budget Governor"
 arch=('any')
 url="https://github.com/The-Little-mega-company/precog-workspace"
 license=('MIT')
-depends=('python' 'tk' 'python-pyqt6')
+depends=('python' 'python-gobject' 'gtk3' 'libayatana-appindicator')
 optdepends=('steam: automatic Steam game library detection')
 provides=('preshader' 'recogd-preshader')
 conflicts=('preshader-git')
 install=preshader.install
 source=("recogd-preshader-unified.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('7fea5c3abb3b1510d4ee0564bc78e3f2c48af744b23b8053ec775595929c7a7a')
 
 package() {
     cd "$srcdir/recogd-workspace"
@@ -22,15 +22,11 @@ package() {
     cp -r src scripts assets tests config.json install.sh README.md LICENSE "$pkgdir/opt/preshader/"
     chmod +x "$pkgdir/opt/preshader/install.sh"
     chmod +x "$pkgdir/opt/preshader/scripts/recogd-launch.sh"
-    chmod +x "$pkgdir/opt/preshader/scripts/bazzite-launch.sh"
 
     # 2. Install system-wide /usr/bin/preshader executable
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/preshader" << 'EOF'
 #!/usr/bin/env bash
-if [ -x "$HOME/recogd-workspace/scripts/recogd-launch.sh" ]; then
-    exec "$HOME/recogd-workspace/scripts/recogd-launch.sh" "$@"
-fi
 exec /opt/preshader/scripts/recogd-launch.sh "$@"
 EOF
     chmod 755 "$pkgdir/usr/bin/preshader"
@@ -49,58 +45,33 @@ Icon=recogd-preshader
 Terminal=false
 StartupNotify=true
 StartupWMClass=recogd-preshader
-Categories=Game;System;Utility;Monitor;
-Keywords=preshader;recogd;steam;cache;ram;dayz;shader;bazzite;control deck;
-Actions=Prewarm;Purge;
-
-[Desktop Action Prewarm]
-Name=Pre-Warm All Preshader Caches to RAM
-Exec=/usr/bin/preshader --prewarm
-
-[Desktop Action Purge]
-Name=Purge Pinned RAM Cache (DONTNEED)
-Exec=/usr/bin/preshader --purge
+Categories=System;Monitor;
+Keywords=preshader;recogd;steam;cache;ram;dayz;shader;control deck;
 EOF
 
-    # 4. Install Permanent System Tray XDG Autostart entry
-    install -dm755 "$pkgdir/etc/xdg/autostart"
-    cat > "$pkgdir/etc/xdg/autostart/recogd-preshader.desktop" << 'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=RecogD Preshader Permanent System Tray
-Exec=/usr/bin/preshader --minimized
-Icon=recogd-preshader
-Terminal=false
-StartupWMClass=recogd-preshader
-X-GNOME-Autostart-enabled=true
-X-KDE-autostart-after=panel
-EOF
-
-    # 5. Install Systemd User Service
+    # 4. Install Systemd User Service
     install -dm755 "$pkgdir/usr/lib/systemd/user"
     cat > "$pkgdir/usr/lib/systemd/user/recogd-preshader.service" << 'EOF'
 [Unit]
-Description=RecogD Preshader Unified Single-Process Engine & Permanent System Tray
+Description=RecogD predictive asset preloader and GTK control deck
 After=graphical-session.target plasma-plasmashell.service
 
 [Service]
 Type=simple
-Environment=DISPLAY=:0
 ExecStart=/usr/bin/preshader --minimized
-Restart=always
+Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
 EOF
 
-    # 6. Install Hicolor Icons (SVG + 256/128/64 PNG)
+    # 5. Install Hicolor Icons (SVG + 256/128/64 PNG)
     install -Dm644 assets/icons/recogd-preshader.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/recogd-preshader.svg"
     install -Dm644 assets/icons/recogd-preshader-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/recogd-preshader.png"
     install -Dm644 assets/icons/recogd-preshader-128.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/recogd-preshader.png"
     install -Dm644 assets/icons/recogd-preshader-64.png "$pkgdir/usr/share/icons/hicolor/64x64/apps/recogd-preshader.png"
 
-    # 7. License
+    # 6. License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

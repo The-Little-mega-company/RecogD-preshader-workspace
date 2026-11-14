@@ -7,7 +7,7 @@ import threading
 
 class RamBudgetGovernor:
     """
-    Dynamic memory-pressure listener for Bazzite / Linux.
+    Dynamic memory-pressure listener for Linux.
     Monitors /proc/meminfo and /proc/pressure/memory (PSI) to gracefully scale back
     pre-pinned asset volumes and evict cached pages via POSIX_FADV_DONTNEED when
     background apps or browser windows demand RAM, preventing swap thrashing.
@@ -29,6 +29,17 @@ class RamBudgetGovernor:
         self.eviction_cycles = 0
 
         self.apply_config(config)
+        root_cfg = config if isinstance(config, dict) else {}
+        self.runtime_max_budget_mb = float(
+            root_cfg.get("max_cache_mb", self.configured_max_budget_mb)
+        )
+        self.runtime_override_configured_cap = False
+        self.runtime_min_free_mb = float(
+            self._clamp_min_free_mb(
+                root_cfg.get("min_free_ram_mb", self.configured_min_free_reserve_mb)
+            )
+        )
+        self._refresh_runtime_limits()
         self.snapshot = {
             "state": "OPTIMAL",
             "scale_factor": 1.0,
@@ -43,12 +54,23 @@ class RamBudgetGovernor:
         }
         self.evaluate(force=True)
 
+    @staticmethod
+    def _clamp_min_free_mb(value):
+        return max(1500, min(8192, int(value)))
+
     def apply_config(self, config):
         cfg = (config or {}).get("ram_governor", {}) if isinstance(config, dict) else {}
         with self.lock:
             self.enabled = bool(cfg.get("enabled", True))
-            self.max_budget_mb = float(cfg.get("max_pinned_budget_mb", 2048.0))
-            self.min_free_reserve_mb = float(cfg.get("min_free_reserve_mb", 1536.0))
+            root_cfg = config if isinstance(config, dict) else {}
+            self.configured_max_budget_mb = float(
+                cfg.get("max_pinned_budget_mb", root_cfg.get("max_cache_mb", 2048.0))
+            )
+            self.configured_min_free_reserve_mb = float(
+                self._clamp_min_free_mb(
+                    cfg.get("min_free_reserve_mb", root_cfg.get("min_free_ram_mb", 1536.0))
+                )
+            )
             self.soft_watermark_ratio = float(cfg.get("soft_available_ratio", 0.28))
             self.hard_watermark_ratio = float(cfg.get("hard_available_ratio", 0.12))
             self.usable_headroom_fraction = float(cfg.get("usable_headroom_fraction", 0.35))
@@ -56,6 +78,24 @@ class RamBudgetGovernor:
             self.psi_hard_threshold = float(cfg.get("psi_some_avg10_hard", 18.0))
             self.swap_spike_threshold_mb = float(cfg.get("swap_spike_threshold_mb", 32.0))
             self.poll_interval_sec = float(cfg.get("poll_interval_seconds", 0.5))
+
+    def _refresh_runtime_limits(self):
+        self.max_budget_mb = (
+            self.runtime_max_budget_mb
+            if self.runtime_override_configured_cap
+            else min(self.configured_max_budget_mb, self.runtime_max_budget_mb)
+        )
+        self.min_free_reserve_mb = max(
+            self.configured_min_free_reserve_mb,
+            self.runtime_min_free_mb
+        )
+
+    def update_limits(self, max_cache_mb, min_free_mb, allow_over_configured_cap=False):
+        with self.lock:
+            self.runtime_max_budget_mb = max(0.0, float(max_cache_mb))
+            self.runtime_override_configured_cap = bool(allow_over_configured_cap)
+            self.runtime_min_free_mb = float(self._clamp_min_free_mb(min_free_mb))
+            self._refresh_runtime_limits()
 
     def _read_meminfo(self):
         info = {}
@@ -220,7 +260,7 @@ class RamBudgetGovernor:
         budget = snap["dynamic_budget_bytes"]
         active = pinner.get_active_pinned_bytes()
         if active > budget:
-            evicted_files, _ = pinner.trim_to_budget(budget)
+            evicted_files = pinner.trim_to_budget(budget)
             if evicted_files > 0:
                 with self.lock:
                     self.eviction_cycles += 1

@@ -316,6 +316,13 @@ class PredictiveVelocityTracker:
             "lookahead_limit": lookahead_limit
         }
 
+    def get_asset_event_rate(self, now=None):
+        if now is None:
+            now = time.monotonic()
+        with self.lock:
+            self._prune_locked(now)
+            return len(self.asset_samples) / max(0.25, self.window_seconds)
+
     def record_corner_boost(self, count=1):
         with self.lock:
             self.corner_boosts += count

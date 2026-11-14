@@ -7,6 +7,11 @@ import shutil
 import time
 from collections import defaultdict
 
+try:
+    from .storage import is_portable_asset_path, normalize_asset_path
+except ImportError:
+    from storage import is_portable_asset_path, normalize_asset_path
+
 
 PRECOMPILED_EXTENSIONS = (
     ".foz", ".dxvk-cache", ".spv", ".bin", ".idx", ".cache",
@@ -26,33 +31,47 @@ def is_placeholder_safe_id(safe_id):
     return "appid_" in low or low.endswith("_unknowngame")
 
 
+def normalize_brain_path(path):
+    if is_portable_asset_path(path):
+        return os.fsdecode(os.fspath(path)).replace("\\", "/")
+    return normalize_asset_path(path)
+
+
 def detect_preshader_mounts():
     """
     Finds the active external Preshader SSD mount and internal NVMe fallback vault.
     """
-    user = os.environ.get("USER", "kessia")
+    user = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
     ext_candidates = [
-        f"/run/media/{user}/preshader",
-        "/run/media/kessiathecreator/preshader",
-        "/run/media/kessia/preshader",
-        f"/var/run/media/{user}/preshader",
-        f"/media/{user}/preshader",
+        os.path.join("/run/media", user, "preshader"),
+        os.path.join("/media", user, "preshader"),
         "/mnt/preshader"
     ]
-    for pattern in ("/run/media/*/*/recogd-vault", "/mnt/*/recogd-vault"):
+    for pattern in (
+        "/run/media/*/*/recogd-vault",
+        "/media/*/*/recogd-vault",
+        "/mnt/*/recogd-vault"
+    ):
         for match in glob.glob(pattern):
-            parent = os.path.dirname(match)
+            parent = os.path.realpath(os.path.dirname(match))
             if parent not in ext_candidates:
                 ext_candidates.append(parent)
+    ext_candidates = [
+        os.path.realpath(os.path.expanduser(candidate))
+        for candidate in ext_candidates
+    ]
 
-    ext_mount = f"/run/media/{user}/preshader"
+    ext_mount = os.path.realpath(ext_candidates[0])
     for cand in ext_candidates:
-        if os.path.isdir(cand) and (os.path.ismount(cand) or os.path.isdir(os.path.join(cand, "recogd-vault"))):
-            ext_mount = os.path.realpath(cand)
+        if os.path.isdir(cand) and (
+            os.path.ismount(cand)
+            or os.path.isdir(os.path.join(cand, "recogd-vault"))
+        ):
+            ext_mount = cand
             break
 
-    ext_vault = os.path.join(ext_mount, "recogd-vault")
-    nvme_vault = os.path.expanduser("~/.cache/recogd-fallback")
+    ext_vault = os.path.realpath(os.path.join(ext_mount, "recogd-vault"))
+    nvme_vault = os.path.realpath(os.path.expanduser("~/.cache/recogd-fallback"))
     return ext_mount, ext_vault, nvme_vault
 
 
@@ -65,9 +84,9 @@ class VaultCacheMerger:
 
     def __init__(self, ext_vault=None, nvme_vault=None):
         ext_mount, default_ext_vault, default_nvme_vault = detect_preshader_mounts()
-        self.ext_mount = ext_mount
-        self.ext_vault = ext_vault or default_ext_vault
-        self.nvme_vault = nvme_vault or default_nvme_vault
+        self.ext_mount = os.path.realpath(os.path.expanduser(ext_mount))
+        self.ext_vault = os.path.realpath(os.path.expanduser(ext_vault or default_ext_vault))
+        self.nvme_vault = os.path.realpath(os.path.expanduser(nvme_vault or default_nvme_vault))
 
     def active_vault_roots(self):
         roots = []
@@ -77,7 +96,7 @@ class VaultCacheMerger:
                 real_r = os.path.realpath(r)
                 if real_r not in seen_real:
                     seen_real.add(real_r)
-                    roots.append(r)
+                    roots.append(real_r)
         return roots
 
     def primary_vault_root(self):
@@ -206,8 +225,10 @@ class VaultCacheMerger:
                 for parent, children in raw_g.items():
                     if isinstance(children, dict):
                         for child, hits in children.items():
-                            merged_graph[parent][child] = max(
-                                merged_graph[parent][child], int(hits)
+                            normalized_parent = normalize_brain_path(parent)
+                            normalized_child = normalize_brain_path(child)
+                            merged_graph[normalized_parent][normalized_child] = max(
+                                merged_graph[normalized_parent][normalized_child], int(hits)
                             )
 
         merged_stripes = {}
@@ -216,7 +237,7 @@ class VaultCacheMerger:
             if isinstance(s_map, dict):
                 for orig, mirrored in s_map.items():
                     if os.path.exists(mirrored):
-                        merged_stripes[orig] = mirrored
+                        merged_stripes[normalize_brain_path(orig)] = os.path.realpath(mirrored)
 
         meta = dict(default_meta or {})
         src_meta = src_data.get("metadata", {})
@@ -236,6 +257,7 @@ class VaultCacheMerger:
             meta["safe_id"] = normalize_safe_id(meta["safe_id"])
 
         meta["updated_at_epoch"] = int(time.time())
+        meta["graph_weight_decay_at_epoch"] = meta["updated_at_epoch"]
         meta["total_parent_nodes"] = len(merged_graph)
         meta["total_edges"] = sum(len(c) for c in merged_graph.values())
         meta["total_striped_assets"] = len(merged_stripes)
