@@ -65,6 +65,8 @@ def main():
         total_mb = stats.get("total_pinned_bytes", 0) / (1024 * 1024)
         nvme_mb = stats.get("nvme_pinned_bytes", 0) / (1024 * 1024)
         ext_mb = stats.get("ext_pinned_bytes", 0) / (1024 * 1024)
+        active_mb = stats.get("active_pinned_bytes", 0) / (1024 * 1024)
+        evicted_mb = stats.get("evicted_bytes", 0) / (1024 * 1024)
 
         print(f"\n>>> GAME: {game_name} (AppID: {appid}) <<<")
         print(f"Brain Path:             {bf}")
@@ -74,6 +76,17 @@ def main():
         print(f"Last Session Pinned:    {stats.get('total_pinned_files', 0)} files ({total_mb:.2f} MB)")
         print(f"  ├─ Internal NVMe Bus: {stats.get('nvme_pinned_files', 0)} files ({nvme_mb:.2f} MB)")
         print(f"  └─ External SATA Bus: {stats.get('ext_pinned_files', 0)} files ({ext_mb:.2f} MB)")
+        print(
+            f"Predictive Velocity:    Peak {stats.get('peak_velocity_score', 0.0):.2f} "
+            f"(State: {stats.get('velocity_state', 'IDLE')}, "
+            f"Corner Lookahead Pins: {stats.get('lookahead_pins_total', 0)})"
+        )
+        print(
+            f"RAM Budget Governor:    {stats.get('ram_governor_state', 'OPTIMAL')} "
+            f"(Scale: {int(stats.get('ram_scale_factor', 1.0) * 100)}%, "
+            f"Active Cache: {active_mb:.2f} MB, "
+            f"Evicted: {stats.get('evicted_files', 0)} files / {evicted_mb:.2f} MB)"
+        )
 
         ranked_parents = sorted(
             graph.items(),

@@ -16,7 +16,8 @@ class RuntimeTelemetry:
             "message": "",
             "updated_at": time.time(),
             "stats": {},
-            "preloaded": []
+            "preloaded": [],
+            "disk_health": None
         }
 
         try:
@@ -63,6 +64,12 @@ class RuntimeTelemetry:
             self.data["updated_at"] = time.time()
             self.data["preloaded"].append(event)
             self.data["preloaded"] = self.data["preloaded"][-100:]
+            self._write_locked()
+
+    def record_disk_health(self, report):
+        with self.lock:
+            self.data["disk_health"] = dict(report) if isinstance(report, dict) else None
+            self.data["updated_at"] = time.time()
             self._write_locked()
 
     def _write(self):

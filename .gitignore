@@ -35,3 +35,7 @@ Cargo.lock
 *~
 *.swp
 *.swo./scripts/recogd-launch.sh dayz
+
+# AUR makepkg temporary build directories
+packaging/aur/pkg/
+packaging/aur/src/

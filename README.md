@@ -31,3 +31,31 @@ python3 src/ui.py
 The selected profile's watch paths must exist. The dashboard reports startup
 errors instead of showing the daemon as running. Runtime telemetry and the last
 100 successful preload requests are stored in `~/.cache/recogd/runtime.json`.
+
+## Disk Health Check & Corrupted Block Repair
+
+RecogD Preshader includes a built-in disk health and block integrity utility for
+the external SSD vault (`/run/media/$USER/preshader` or `/mnt/preshader`) and
+local NVMe fallback caches.
+
+- **Read-only health check** (SMART telemetry, read-only `badblocks` check,
+  mount read-only detection, and user-space vault/shader cache integrity scan):
+  ```sh
+  preshader --disk-check
+  ```
+- **Repair mode** (quarantines corrupted `.json` brains to `.corrupt.bak`,
+  removes truncated/unreadable cache files, re-syncs healthy copies from the
+  twin vault, and runs `fsck -p` only when the filesystem is unmounted and
+  permitted):
+  ```sh
+  preshader --disk-repair
+  # or:
+  preshader --disk-check --repair
+  ```
+- **Control Deck GUI**: Open the **⛨ Disk Health & Repair** tab in the Control
+  Deck to run health checks or repairs asynchronously and view live SMART,
+  bad-sector, and vault integrity readouts.
+
+> Note: The utility runs safely in user space without escalating privileges. If
+> `smartctl` or `badblocks` requires raw block-device permission, it logs a
+> warning and continues with the user-space vault integrity scan.
