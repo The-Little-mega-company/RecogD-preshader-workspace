@@ -5,8 +5,18 @@ import time
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERSISTENT_CONFIG_PATH = os.path.join(WORKSPACE_DIR, "config.json")
-LIVE_CONFIG_PATH = f"/dev/shm/recogd_config_{os.getuid()}.json"
-LIVE_STATE_PATH = f"/dev/shm/recogd_state_{os.getuid()}.json"
+USER_CONFIG_PATH = os.environ.get(
+    "RECOGD_USER_CONFIG_PATH",
+    os.path.expanduser("~/.config/recogd/config.json")
+)
+LIVE_CONFIG_PATH = os.environ.get(
+    "RECOGD_LIVE_CONFIG_PATH",
+    f"/dev/shm/recogd_config_{os.getuid()}.json"
+)
+LIVE_STATE_PATH = os.environ.get(
+    "RECOGD_LIVE_STATE_PATH",
+    f"/dev/shm/recogd_state_{os.getuid()}.json"
+)
 
 DEFAULT_CONFIG = {
     "max_cache_mb": 1536,
@@ -17,7 +27,8 @@ DEFAULT_CONFIG = {
     "force_combat_shield": False,
     "pause_engine": False,
     "flush_generation": 0,
-    "shutdown_requested": False
+    "shutdown_requested": False,
+    "show_gui_request": ""
 }
 
 DEFAULT_STATE = {
@@ -46,6 +57,12 @@ DEFAULT_STATE = {
 
 
 def _atomic_write_json(path, data):
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            pass
     tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -73,11 +90,20 @@ def _read_json(path, fallback):
         return dict(fallback)
 
 
+def _load_persistent_config():
+    if os.path.exists(USER_CONFIG_PATH):
+        return _read_json(USER_CONFIG_PATH, DEFAULT_CONFIG)
+    seed = _read_json(PERSISTENT_CONFIG_PATH, DEFAULT_CONFIG)
+    _atomic_write_json(USER_CONFIG_PATH, seed)
+    return seed
+
+
 def init_live_config():
-    saved = _read_json(PERSISTENT_CONFIG_PATH, DEFAULT_CONFIG)
+    saved = _load_persistent_config()
     saved["force_combat_shield"] = False
     saved["pause_engine"] = False
     saved["shutdown_requested"] = False
+    saved["show_gui_request"] = ""
     _atomic_write_json(LIVE_CONFIG_PATH, saved)
     return saved
 
@@ -97,8 +123,15 @@ def update_live_config(updates, save_persistent=True):
         persistent_copy["force_combat_shield"] = False
         persistent_copy["pause_engine"] = False
         persistent_copy["shutdown_requested"] = False
-        _atomic_write_json(PERSISTENT_CONFIG_PATH, persistent_copy)
+        persistent_copy["show_gui_request"] = ""
+        _atomic_write_json(USER_CONFIG_PATH, persistent_copy)
+        if os.access(WORKSPACE_DIR, os.W_OK):
+            _atomic_write_json(PERSISTENT_CONFIG_PATH, persistent_copy)
     return cfg
+
+
+def request_gui_show():
+    return update_live_config({"show_gui_request": str(time.time())}, save_persistent=False)
 
 
 def write_live_state(state_updates):

@@ -7,7 +7,7 @@ import threading
 
 class RamBudgetGovernor:
     """
-    Dynamic memory-pressure listener for Bazzite / Linux.
+    Dynamic memory-pressure listener for Linux.
     Monitors /proc/meminfo and /proc/pressure/memory (PSI) to gracefully scale back
     pre-pinned asset volumes and evict cached pages via POSIX_FADV_DONTNEED when
     background apps or browser windows demand RAM, preventing swap thrashing.

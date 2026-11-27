@@ -2,6 +2,7 @@
 import glob
 import json
 import os
+import pwd
 import re
 import shutil
 import time
@@ -30,22 +31,25 @@ def detect_preshader_mounts():
     """
     Finds the active external Preshader SSD mount and internal NVMe fallback vault.
     """
-    user = os.environ.get("USER", "kessia")
+    user = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
     ext_candidates = [
+        "/mnt/preshader",
         f"/run/media/{user}/preshader",
-        "/run/media/kessiathecreator/preshader",
-        "/run/media/kessia/preshader",
         f"/var/run/media/{user}/preshader",
         f"/media/{user}/preshader",
-        "/mnt/preshader"
     ]
-    for pattern in ("/run/media/*/*/recogd-vault", "/mnt/*/recogd-vault"):
+    for pattern in (
+        "/mnt/*/recogd-vault",
+        "/run/media/*/*/recogd-vault",
+        "/var/run/media/*/*/recogd-vault",
+        "/media/*/*/recogd-vault",
+    ):
         for match in glob.glob(pattern):
             parent = os.path.dirname(match)
             if parent not in ext_candidates:
                 ext_candidates.append(parent)
 
-    ext_mount = f"/run/media/{user}/preshader"
+    ext_mount = "/mnt/preshader"
     for cand in ext_candidates:
         if os.path.isdir(cand) and (os.path.ismount(cand) or os.path.isdir(os.path.join(cand, "recogd-vault"))):
             ext_mount = os.path.realpath(cand)
@@ -54,6 +58,7 @@ def detect_preshader_mounts():
     ext_vault = os.path.join(ext_mount, "recogd-vault")
     nvme_vault = os.path.expanduser("~/.cache/recogd-fallback")
     return ext_mount, ext_vault, nvme_vault
+
 
 
 class VaultCacheMerger:

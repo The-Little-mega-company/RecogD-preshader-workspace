@@ -2,10 +2,13 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
+from src.pinner import AssetPinner
+from src.storage import BrainStorage
 from src.telemetry import RuntimeTelemetry
 
 
@@ -52,96 +55,78 @@ class RuntimeTelemetryTests(unittest.TestCase):
 
 class PinnerTelemetryTests(unittest.TestCase):
     def test_records_successful_cache_hint(self):
-        import threading
-
-        from src.pinner import RamPinner
-
         with tempfile.TemporaryDirectory() as directory:
             asset_path = os.path.join(directory, "asset.pbo")
             with open(asset_path, "wb") as asset_file:
                 asset_file.write(b"asset data")
-            completed = threading.Event()
-            events = []
 
-            def record_preload(path, size, is_external, stats):
-                events.append((path, size, is_external, stats))
-                completed.set()
-
-            pinner = RamPinner(preload_callback=record_preload)
+            storage = BrainStorage(
+                vault_root=directory,
+                game_info={"appid": "221100", "name": "DayZ", "safe_id": "221100_DayZ"},
+                external_mount=directory,
+                enable_striping=False
+            )
+            pinner = AssetPinner(storage, max_file_mb=16)
+            pinner.apply_live_config({"max_cache_mb": 1536, "min_free_ram_mb": 1024})
             try:
                 self.assertTrue(pinner.request_pin(asset_path))
-                self.assertTrue(completed.wait(2))
+                stats = pinner.get_stats()
+                self.assertEqual(stats["total_pinned_files"], 1)
             finally:
-                pinner.shutdown()
-
-            self.assertEqual(events[0][0], asset_path)
-            self.assertEqual(events[0][1], len(b"asset data"))
-            self.assertFalse(events[0][2])
-            self.assertEqual(events[0][3]["total_pinned_files"], 1)
+                storage.shutdown()
 
 
 class DaemonLifecycleTests(unittest.TestCase):
     def test_daemon_reports_running_and_stopped(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with tempfile.TemporaryDirectory() as directory:
-            watch_path = os.path.join(directory, "watch")
-            os.makedirs(watch_path)
-            config_path = os.path.join(directory, "config.json")
-            telemetry_path = os.path.join(directory, "runtime.json")
-            brain_path = os.path.join(directory, "brain.json")
-            profile = {
-                "watch_directories": [watch_path],
-                "shader_vault_dirs": [],
-                "brain_db_path": brain_path,
-                "fallback_db_path": brain_path,
-                "stripe_cache_dir": os.path.join(directory, "stripes")
-            }
-            config = {
-                "engine": {"max_parent_nodes": 10},
-                "external_drive": {
-                    "mount_point": directory,
-                    "enable_cross_bus_striping": False
-                },
-                "target_extensions": [".pbo"],
-                "profiles": {"test": profile}
-            }
-            with open(config_path, "w", encoding="utf-8") as config_file:
-                json.dump(config, config_file)
+            live_cfg_path = os.path.join(directory, "live_config.json")
+            live_state_path = os.path.join(directory, "live_state.json")
+            user_cfg_path = os.path.join(directory, "user_config.json")
+            env = dict(os.environ)
+            env["RECOGD_LIVE_CONFIG_PATH"] = live_cfg_path
+            env["RECOGD_LIVE_STATE_PATH"] = live_state_path
+            env["RECOGD_USER_CONFIG_PATH"] = user_cfg_path
 
             process = subprocess.Popen(
                 [
-                    os.sys.executable,
+                    sys.executable,
+                    "-u",
                     os.path.join(project_root, "src", "daemon.py"),
-                    "--profile", "test",
-                    "--config", config_path,
-                    "--telemetry", telemetry_path
+                    "--vault-root", directory,
+                    "--ext-mount", directory
                 ],
                 cwd=project_root,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True
             )
             try:
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 5.0
+                daemon_online = False
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
                         output = process.stdout.read() if process.stdout else ""
                         self.fail(f"Daemon exited before running:\n{output}")
                     try:
-                        with open(telemetry_path, "r", encoding="utf-8") as telemetry_file:
-                            status = json.load(telemetry_file).get("status")
+                        with open(live_state_path, "r", encoding="utf-8") as state_file:
+                            daemon_online = bool(json.load(state_file).get("daemon_online"))
                     except (FileNotFoundError, json.JSONDecodeError):
-                        status = None
-                    if status == "running":
+                        daemon_online = False
+                    if daemon_online:
                         break
                     time.sleep(0.05)
-                self.assertEqual(status, "running")
+
+                self.assertTrue(daemon_online)
 
                 process.send_signal(signal.SIGTERM)
                 self.assertEqual(process.wait(timeout=5), 0)
-                with open(telemetry_path, "r", encoding="utf-8") as telemetry_file:
-                    final_status = json.load(telemetry_file).get("status")
-                self.assertEqual(final_status, "stopped")
+                output = process.stdout.read() if process.stdout else ""
+                self.assertIn("PRESHADER UNIVERSAL DAEMON ACTIVE", output)
+                with open(live_state_path, "r", encoding="utf-8") as state_file:
+                    final_online = bool(json.load(state_file).get("daemon_online"))
+                self.assertFalse(final_online)
             finally:
                 if process.poll() is None:
                     process.terminate()

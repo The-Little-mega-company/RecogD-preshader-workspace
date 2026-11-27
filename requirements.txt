@@ -1,2 +1,3 @@
-Pillow>=10.0
-pystray>=0.19
+# System GTK3, PyGObject, and Ayatana AppIndicator bindings are installed via
+# native distribution packages (pacman / apt) by ./install.sh.
+# No pip packages are required (avoids PEP 668 externally-managed-environment errors).

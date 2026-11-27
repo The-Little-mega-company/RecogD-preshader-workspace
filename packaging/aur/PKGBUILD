@@ -4,9 +4,9 @@ pkgver=2.0.0
 pkgrel=1
 pkgdesc="RecogD Preshader Unified Control Deck: Predictive Game Asset Preloader, Dual-Bus Vault Merger & Dynamic RAM Budget Governor"
 arch=('any')
-url="https://github.com/The-Little-mega-company/precog-workspace"
+url="https://github.com/The-Little-mega-company/RecogD-preshader-workspace"
 license=('MIT')
-depends=('python' 'tk' 'python-pyqt6')
+depends=('python' 'python-gobject' 'gtk3' 'libayatana-appindicator' 'desktop-file-utils' 'hicolor-icon-theme')
 optdepends=('steam: automatic Steam game library detection')
 provides=('preshader' 'recogd-preshader')
 conflicts=('preshader-git')
@@ -22,14 +22,13 @@ package() {
     cp -r src scripts assets tests config.json install.sh README.md LICENSE "$pkgdir/opt/preshader/"
     chmod +x "$pkgdir/opt/preshader/install.sh"
     chmod +x "$pkgdir/opt/preshader/scripts/recogd-launch.sh"
-    chmod +x "$pkgdir/opt/preshader/scripts/bazzite-launch.sh"
 
     # 2. Install system-wide /usr/bin/preshader executable
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/preshader" << 'EOF'
 #!/usr/bin/env bash
-if [ -x "$HOME/recogd-workspace/scripts/recogd-launch.sh" ]; then
-    exec "$HOME/recogd-workspace/scripts/recogd-launch.sh" "$@"
+if [ -x "$HOME/.local/share/recogd-preshader/scripts/recogd-launch.sh" ]; then
+    exec "$HOME/.local/share/recogd-preshader/scripts/recogd-launch.sh" "$@"
 fi
 exec /opt/preshader/scripts/recogd-launch.sh "$@"
 EOF
@@ -49,8 +48,8 @@ Icon=recogd-preshader
 Terminal=false
 StartupNotify=true
 StartupWMClass=recogd-preshader
-Categories=Game;System;Utility;Monitor;
-Keywords=preshader;recogd;steam;cache;ram;dayz;shader;bazzite;control deck;
+Categories=System;Monitor;
+Keywords=preshader;recogd;steam;cache;ram;dayz;shader;linux;control deck;
 Actions=Prewarm;Purge;
 
 [Desktop Action Prewarm]
@@ -86,9 +85,8 @@ After=graphical-session.target plasma-plasmashell.service
 
 [Service]
 Type=simple
-Environment=DISPLAY=:0
-ExecStart=/usr/bin/preshader --minimized
-Restart=always
+ExecStart=/usr/bin/preshader --nogui
+Restart=on-failure
 RestartSec=2
 
 [Install]

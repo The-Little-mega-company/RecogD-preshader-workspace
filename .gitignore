@@ -34,4 +34,12 @@ Cargo.lock
 .DS_Store
 *~
 *.swp
-*.swo./scripts/recogd-launch.sh dayz
+*.swo
+
+# Local packaging & generated dump artifacts
+packaging/aur/pkg/
+packaging/aur/src/
+packaging/aur/*.tar.gz
+packaging/aur/*.pkg.tar.zst
+workspace-dump.md
+codebase.md

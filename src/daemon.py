@@ -137,25 +137,35 @@ class InotifyMonitor:
 
 
 def discover_steam_games():
-    roots = [
+    candidate_roots = [
         os.path.expanduser("~/.local/share/Steam"),
+        os.path.expanduser("~/.steam/steam"),
+        os.path.expanduser("~/.steam/debian-installation"),
         os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam")
     ]
+    seen_roots = set()
+    roots = []
+    for r in candidate_roots:
+        if os.path.isdir(r):
+            real_r = os.path.realpath(r)
+            if real_r not in seen_roots:
+                seen_roots.add(real_r)
+                roots.append(real_r)
+
     libraries = set()
     for r in roots:
-        if os.path.isdir(r):
-            libraries.add(os.path.abspath(r))
-            vdf = os.path.join(r, "steamapps", "libraryfolders.vdf")
-            if os.path.isfile(vdf):
-                try:
-                    with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
-                        for line in f:
-                            if '"path"' in line:
-                                parts = line.split('"')
-                                if len(parts) >= 4 and os.path.isdir(parts[3]):
-                                    libraries.add(os.path.abspath(parts[3]))
-                except Exception:
-                    pass
+        libraries.add(r)
+        vdf = os.path.join(r, "steamapps", "libraryfolders.vdf")
+        if os.path.isfile(vdf):
+            try:
+                with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"path"' in line:
+                            parts = line.split('"')
+                            if len(parts) >= 4 and os.path.isdir(parts[3]):
+                                libraries.add(os.path.realpath(parts[3]))
+            except Exception:
+                pass
 
     games = {}
     for lib in libraries:

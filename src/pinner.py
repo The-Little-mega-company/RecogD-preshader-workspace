@@ -17,7 +17,7 @@ class RamBudgetGovernor:
 
     def update_limits(self, max_cache_mb, min_free_mb):
         self.max_budget_bytes = int(max(256, min(4096, int(max_cache_mb))) * 1024 * 1024)
-        self.min_free_bytes = int(max(2048, min(8192, int(min_free_mb))) * 1024 * 1024)
+        self.min_free_bytes = int(max(1024, min(8192, int(min_free_mb))) * 1024 * 1024)
 
     def _read_meminfo_bytes(self, key):
         try:

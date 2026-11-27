@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
-import os
+import subprocess
 # Force working directory to script location so relative assets resolve properly
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.chdir("..")
@@ -13,18 +13,33 @@ try:
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, Gdk, GLib
+    GLib.set_prgname("recogd-preshader")
+    GLib.set_application_name("RecogD Preshader Control Deck")
+    Gtk.Window.set_default_icon_name("recogd-preshader")
 except Exception as e:
     print(f"[GUI-WARN] GTK3 unavailable ({e}). Running in CLI-only mode.")
     sys.exit(0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.dirname(SCRIPT_DIR)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import config_ipc
 
 APP_INDICATOR = None
-for mod_name in ("AyatanaAppIndicator3", "AppIndicator3"):
+IS_WAYLAND_SESSION = (
+    (
+        bool(os.environ.get("WAYLAND_DISPLAY"))
+        or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+    and not os.environ.get("GDK_BACKEND", "").lower().startswith("x11")
+)
+indicator_modules = ("AyatanaAppIndicator3",) if IS_WAYLAND_SESSION else (
+    "AyatanaAppIndicator3",
+    "AppIndicator3"
+)
+for mod_name in indicator_modules:
     try:
         gi.require_version(mod_name, "0.1")
         APP_INDICATOR = getattr(gi.repository, mod_name)
@@ -132,16 +147,27 @@ def create_tray_icons():
 class SimpleControlDeck(Gtk.Window):
     def __init__(self):
         super().__init__(title="RecogD Preshader — Control Deck")
+        try:
+            self.set_wmclass("recogd-preshader", "recogd-preshader")
+        except Exception:
+            pass
         self.set_default_size(500, 520)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(12)
 
         self.icons = create_tray_icons()
-        if os.path.exists(self.icons["standby"]):
-            try:
-                self.set_icon_from_file(self.icons["standby"])
-            except Exception:
-                pass
+        icon_candidates = [
+            os.path.join(WORKSPACE_DIR, "assets", "icons", "recogd-preshader-256.png"),
+            os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/recogd-preshader.png"),
+            self.icons["standby"]
+        ]
+        for icon_path in icon_candidates:
+            if os.path.exists(icon_path):
+                try:
+                    self.set_icon_from_file(icon_path)
+                    break
+                except Exception:
+                    pass
 
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(DIRECT_CSS)
@@ -152,6 +178,8 @@ class SimpleControlDeck(Gtk.Window):
         )
 
         self.cfg = config_ipc.read_live_config()
+        self.last_gui_show_request = str(self.cfg.get("show_gui_request", ""))
+        self.daemon_start_process = None
         self.current_icon = "standby"
         self.connect("delete-event", self._on_close_to_tray)
 
@@ -165,9 +193,14 @@ class SimpleControlDeck(Gtk.Window):
         self.add(vbox)
 
         # 1. Top Status Banner
+        self.banner_event = Gtk.EventBox()
+        self.banner_event.connect("button-press-event", self._start_daemon_on_banner)
+        self.banner_event.set_tooltip_text("Click here to start RecogD if the daemon is offline")
+        vbox.pack_start(self.banner_event, False, False, 0)
+
         self.banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.banner.get_style_context().add_class("banner-normal")
-        vbox.pack_start(self.banner, False, False, 0)
+        self.banner_event.add(self.banner)
 
         self.lbl_title = Gtk.Label(label="RECOGD PRESHADER — DIRECT DECK")
         self.lbl_title.get_style_context().add_class("title-text")
@@ -244,7 +277,7 @@ class SimpleControlDeck(Gtk.Window):
         self.slider_free_ram = self._create_slider(
             sliders_box,
             "Protected Free System RAM Floor (MB) [Prevents Crashes]:",
-            3000, 7000, 250,
+            1024, 7000, 250,
             self.cfg.get("min_free_ram_mb", 4500)
         )
         self.slider_hops = self._create_slider(
@@ -315,13 +348,15 @@ class SimpleControlDeck(Gtk.Window):
             except Exception:
                 self.indicator = None
 
-        if self.indicator is None:
+        if self.indicator is None and not IS_WAYLAND_SESSION:
             self.status_icon = Gtk.StatusIcon()
             self.status_icon.set_from_file(self.icons["standby"])
             self.status_icon.set_tooltip_text("RecogD Preshader Control Deck")
             self.status_icon.connect("activate", self._toggle_window)
             self.status_icon.connect("popup-menu", self._on_tray_popup)
             self.status_icon.set_visible(True)
+        elif self.indicator is None:
+            print("[GUI-WARN] Ayatana AppIndicator is unavailable; tray icon disabled on Wayland.")
 
     def _update_tray_icon(self, key):
         if key == self.current_icon:
@@ -339,18 +374,47 @@ class SimpleControlDeck(Gtk.Window):
             except Exception:
                 pass
 
+    def _clear_keep_above(self):
+        self.set_keep_above(False)
+        return False
+
+    def _present_forcefully(self, keep_above_temp=False):
+        self.show_all()
+        self.deiconify()
+        self.present()
+        if keep_above_temp:
+            self.set_keep_above(True)
+            GLib.timeout_add(1500, self._clear_keep_above)
+
     def _toggle_window(self, *_):
         if self.get_visible():
             self.hide()
         else:
-            self.deiconify()
-            self.present()
+            self._present_forcefully()
 
     def _on_tray_popup(self, icon, button, activate_time):
         self.menu.popup(None, None, None, None, button, activate_time)
 
     def _on_close_to_tray(self, *_):
         self.hide()
+        return True
+
+    def _start_daemon_on_banner(self, _widget, event):
+        if event.button != 1 or config_ipc.read_live_state().get("daemon_online", False):
+            return False
+        if self.daemon_start_process is not None and self.daemon_start_process.poll() is None:
+            return True
+
+        launcher = os.path.join(WORKSPACE_DIR, "scripts", "recogd-launch.sh")
+        try:
+            self.daemon_start_process = subprocess.Popen(
+                ["bash", launcher, "--nogui"],
+                cwd=WORKSPACE_DIR,
+                start_new_session=True
+            )
+            self.lbl_status.set_text("State: Starting daemon...")
+        except OSError as exc:
+            self.lbl_status.set_text(f"State: Could not start daemon ({exc})")
         return True
 
     def _toggle_shield(self, *_):
@@ -385,6 +449,10 @@ class SimpleControlDeck(Gtk.Window):
     def _poll_state(self):
         state = config_ipc.read_live_state()
         self.cfg = config_ipc.read_live_config()
+        show_req = str(self.cfg.get("show_gui_request", ""))
+        if show_req and show_req != self.last_gui_show_request:
+            self.last_gui_show_request = show_req
+            self._present_forcefully()
 
         shield_locked = bool(self.cfg.get("force_combat_shield", False))
         paused = bool(self.cfg.get("pause_engine", False))
@@ -424,9 +492,14 @@ class SimpleControlDeck(Gtk.Window):
             b_ctx.add_class("banner-normal")
             self._update_tray_icon("standby")
 
-        self.lbl_status.set_text(
-            f"State: {state.get('status_text', 'STANDBY')}  |  Vault: {state.get('vault_mode', 'Auto')}"
-        )
+        if state.get("daemon_online", False):
+            self.lbl_status.set_text(
+                f"State: {state.get('status_text', 'STANDBY')}  |  Vault: {state.get('vault_mode', 'Auto')}"
+            )
+        else:
+            self.lbl_status.set_text(
+                "State: DAEMON OFFLINE  |  Run 'preshader' or click banner to start"
+            )
         self.lbl_game.set_text(
             f"Game: {state.get('game_name', 'None')} (AppID: {state.get('appid', '-')})"
         )
@@ -452,9 +525,24 @@ class SimpleControlDeck(Gtk.Window):
 
 
 def main():
+    args_lower = {a.lower() for a in sys.argv[1:]}
+    minimized = "--minimized" in args_lower
+    force_gui = bool(args_lower & {"--force-gui", "--gui", "gui"})
+
     win = SimpleControlDeck()
-    win.show_all()
-    Gtk.main()
+    if minimized:
+        if win.indicator is None and win.status_icon is None:
+            sys.exit(0)
+        if win.get_child():
+            win.get_child().show_all()
+        win.hide()
+    else:
+        win._present_forcefully(keep_above_temp=force_gui)
+
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        Gtk.main_quit()
 
 
 if __name__ == "__main__":
