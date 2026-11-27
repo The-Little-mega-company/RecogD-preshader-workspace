@@ -15,17 +15,13 @@ the tray icon), then install the Python tray packages and start the dashboard.
 The daemon uses Linux kernel inotify directly and does not need `inotifywait`.
 
 ```sh
-# Debian/Ubuntu
-sudo apt install python3-tk python3-gi gir1.2-gtk-3.0
-
-# Fedora
-sudo dnf install python3-tkinter python3-gobject gtk3
-
-# Arch Linux
-sudo pacman -S tk python-gobject gtk3
-
-python3 -m pip install -r requirements.txt
-python3 src/ui.py
+Arch:
+git clone https://github.com/The-Little-mega-company/RecogD-preshader-workspace.git
+cd RecogD-preshader-workspace
+chmod +x install.sh
+./install.sh
+debian apt based distrobutions:
+curl -fsSL https://raw.githubusercontent.com/The-Little-mega-company/RecogD-preshader-workspace/main/web-install.sh | bash
 ```
 
 The selected profile's watch paths must exist. The dashboard reports startup
